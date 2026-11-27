@@ -19,6 +19,14 @@ class LiveProtocolError(ConnectionError):
     """Safe protocol diagnostic. Never includes a response body."""
 
 
+class LivePolicyClose(LiveProtocolError):
+    """A policy close after setup. Reconnect only when there is context to send."""
+
+    def __init__(self, message, *, expected_expiry=False):
+        super().__init__(message)
+        self.expected_expiry = expected_expiry
+
+
 def live_error(error):
     if isinstance(error, (LiveSetupError, LiveProtocolError)):
         return str(error)
@@ -83,6 +91,7 @@ class LiveSession:
         self.task = None
         self.closing = set()
         self.sent = self.frames = self.reconnects = 0
+        self.last_frame_sent = None
         self.error = self.connected = self.tokens = self.latency = None
         self.last_success = None
         self.reset_output()
@@ -205,7 +214,6 @@ class LiveSession:
                         self.hold('window_changed_before_send')
                     break
                 self.sent += 1
-                self.frames += int(kind == 'SCREEN_FRAME' and event.data is not None)
                 if kind == 'ACTIVITY_DURATION':
                     if self.stream.pending:
                         wake.set()
@@ -216,7 +224,10 @@ class LiveSession:
             return False
         if self.observation_current and not self.observation_current(event.stamp):
             return False
-        await transport.send(event)
+        sent_frame = await transport.send(event)
+        if sent_frame is not None:
+            self.frames += 1
+            self.last_frame_sent = time.time()
         return True
 
     @staticmethod
@@ -278,11 +289,12 @@ class LiveSession:
     async def _run(self, generation, previous):
         if previous:
             await asyncio.shield(asyncio.gather(*previous, return_exceptions=True))
-        failures = 0
+        failures = policy_failures = 0
         while self.stream.generation == generation:
             transport = None
             workers = []
             attempt_started = None
+            defer_until_observation = False
             try:
                 self.connection_state = 'RECONNECTING' if failures else 'CONNECTING'
                 transport = self.factory()
@@ -307,8 +319,22 @@ class LiveSession:
                 if self.stream.generation != generation:
                     return
                 fatal = isinstance(err, LiveSetupError)
+                diagnostic = live_error(err)
+                if isinstance(err, LivePolicyClose):
+                    defer_until_observation = True
+                    if err.expected_expiry:
+                        policy_failures = 0
+                    else:
+                        if attempt_started is not None and time.monotonic() - attempt_started >= 30:
+                            policy_failures = 0
+                        policy_failures += 1
+                        if policy_failures >= 3:
+                            fatal = True
+                            diagnostic += ' Сервер повторил отклонение после переподключений.'
+                else:
+                    policy_failures = 0
                 self.connection_state = 'ERROR' if fatal else 'RECONNECTING'
-                self.error = live_error(err)
+                self.error = diagnostic
                 LOG.warning('Gemini Live %s: %s', self.connection_state, self.error)
                 self.label = self.previous_label = None
                 self.connected = None
@@ -333,6 +359,20 @@ class LiveSession:
             failures += 1
             self.reconnects += 1
             await asyncio.sleep(min(30, 2 ** min(5, failures - 1)))
+            if defer_until_observation:
+                await self._wait_for_observation(generation)
+
+    async def _wait_for_observation(self, generation):
+        wake = self.wake
+        while (self.stream.generation == generation and
+               (self.block_reason or 'ACTIVITY_DURATION' not in self.stream.pending)):
+            await wake.wait()
+            if self.stream.generation != generation:
+                return
+            wake.clear()
+        # Leave the pending turn available to the new sender.
+        if self.stream.generation == generation:
+            wake.set()
 
     async def close(self):
         self.stop('shutdown')
@@ -341,6 +381,7 @@ class LiveSession:
     def diagnostics(self):
         return dict(model=self.model, connection_state=self.connection_state, analysis_state=self.analysis_state,
                     block_reason=self.block_reason, events=self.sent, frames=self.frames,
+                    last_frame_sent=self.last_frame_sent,
                     connected_seconds=int(time.monotonic() - self.connected) if self.connected else 0,
                     latency_ms=self.latency, last_success=self.last_success, reconnects=self.reconnects, tokens=self.tokens, error=self.error,
                     result=vars(self.result) if self.result else None, comment=self.last_comment)

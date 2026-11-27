@@ -594,15 +594,35 @@ function activityStatus(st) {
     <div><span class="note">Открытые приложения</span><b>${esc(src.apps.join(', ') || '—')}</b></div>
   </div>
   <div class="inl sprint-actions">
-    ${src.armed ? '<button class="btn dark" type="button" data-ctl="focus_capture_stop">Остановить захват</button>'
-    : live && src.enabled && src.available ?
-      '<button class="btn" type="button" data-act="capturechoices">Выбрать рабочее окно</button>' : ''}
+    ${src.capture_enabled ? '<button class="btn dark" type="button" data-ctl="focus_capture_stop">Остановить автозахват</button>'
+    : live && src.available && Object.hasOwn(src, 'capture_active') ?
+      '<button class="btn dark" type="button" data-ctl="focus_capture_start">Включить автозахват</button>' : ''}
     ${live ? '<button class="btn" type="button" data-ctl="pause">Пауза мониторинга</button>' : ''}
   </div>
-  <p class="note">${src.armed ? src.capturing ? 'Захват рабочего окна включён. Ctrl+Shift+F9 останавливает его.' :
-    'Захват ожидает выбранное рабочее окно на переднем плане.' :
-    'Захват выключен. Кадры остаются в памяти приложения.'}</p>
-  ${src.capture_error || src.media_error ? `<p class="note">Источник данных недоступен · ${esc(src.capture_error || src.media_error)}</p>` : ''}`;
+  <p class="note">${src.capture_active ? 'Автозахват активного окна включён для этого спринта.' :
+    src.capture_enabled ? 'Автозахват приостановлен вместе со спринтом.' : 'Автозахват выключен.'}
+    ${src.capture_active && f.hotkey ? ' Ctrl+Shift+F9 останавливает захват.' : ''}</p>
+  ${src.media_error ? `<p class="note">Медиасеанс недоступен · ${esc(src.media_error)}</p>` : ''}`;
+}
+
+function captureDiagnostics(st) {
+  const src = st?.focus?.sources;
+  if (!src || !Object.hasOwn(src, 'capture_active')) return '<p class="note">Диагностика доступна после запуска обновлённого трекера.</p>';
+  const engine = st.focus.live_engine;
+  const time = (seconds) => seconds ? new Date(seconds * 1000).toLocaleTimeString('ru-RU') : '—';
+  const skipped = {disabled: 'Автозахват выключен', sprint_inactive: 'Спринт на паузе', idle: 'Мониторинг приостановлен',
+    window_excluded: 'Окно исключено или недоступно', foreground_changed: 'Активное окно сменилось',
+    protected_window: 'Захват запрещён приложением', sensitive_controls: 'Обнаружено защищённое поле',
+    browser_unverified: 'Безопасность страницы браузера не подтверждена', browser_changed: 'Страница изменилась во время захвата',
+    invalid_dimensions: 'Недопустимый размер окна', blank_frame: 'Пустой кадр',
+    unchanged: 'Кадр не изменился', capture_failed: 'Ошибка захвата'};
+  const size = src.last_size;
+  const fields = [['Получено кадров', src.frames_captured], ['Отправлено Gemini', engine?.frames ?? 0],
+    ['Размер последнего кадра', size ? `${size.width}×${size.height} · ${size.bytes} байт` : '—'],
+    ['Последний захват', time(src.last_capture)], ['Последняя отправка', time(engine?.last_frame_sent)],
+    ['Причина пропуска', skipped[src.capture_skip] ?? '—']];
+  return `<div class="activity-grid">${fields.map(([label, value]) =>
+    `<div><span class="note">${label}</span><b>${esc(value)}</b></div>`).join('')}</div>`;
 }
 
 function contextField(label, key, options) {
@@ -622,17 +642,18 @@ PAGES.activity = {
   render() {
     return `<header class="ph"><h1>Монитор активности</h1>${saveBar()}</header>
       <section class="card pad" data-activity-live>${activityStatus(S.status)}</section>
-      <section class="card pad" data-capture-choices hidden></section>
+      <section class="card pad">
+        <div class="inl"><h2>Кадры</h2><button class="btn" data-act="contextpreview">Предпросмотр последнего кадра</button></div>
+        <div data-capture-diagnostics>${captureDiagnostics(S.status)}</div>
+        <img class="context-image" data-context-image alt="Последний кадр активного окна" hidden>
+      </section>
       <section class="card">
         <div class="card-top"><h2>Источники контекста</h2></div>
-        ${contextFlag('Разрешить ручной захват окна', 'capture_enabled')}
-        ${contextField('Режим захвата', 'capture_mode', [['event', 'По изменению кадра'], ['periodic', 'Периодический']])}
-        ${contextNumber('Интервал захвата, с', 'capture_interval', 3, 120)}
+        ${contextNumber('Интервал захвата, с', 'capture_interval', 2, 120)}
         ${contextNumber('Максимальная ширина, px', 'capture_width', 160, 1600)}
         ${contextNumber('Максимальная высота, px', 'capture_height', 160, 1600)}
         ${contextNumber('Качество JPEG', 'capture_quality', 35, 95)}
-        ${row('Рабочие приложения для захвата', 'Укажи полный путь к EXE, в том числе chrome.exe. Разрешение применяется после перезапуска.', 'capture_apps',
-          lw('capture_apps', 'rows', { name: 'Путь к EXE', add: 'Добавить приложение' }))}
+        ${contextFlag('Передавать изображения в Gemini', 'activity_send_remote_images')}
         ${row('Исключённые приложения', 'Имя EXE или полный путь', 'activity_excluded_apps',
           lw('activity_excluded_apps', 'rows', { name: 'Приложение', add: 'Исключить приложение' }))}
         ${row('Исключённые окна', 'Любой фрагмент заголовка', 'activity_excluded_windows',
@@ -705,7 +726,6 @@ PAGES.live = {
         ${contextField('Голос', 'gemini_live_voice', Object.entries(S.voices))}
         ${row('API-ключ Gemini', '', 'google_assistant_api_key', txt('google_assistant_api_key', {secret: true, label: 'API-ключ Gemini'}))}
         ${contextFlag('Передавать цель и текстовый контекст активности в Google', 'activity_allow_remote')}
-        ${contextFlag('Передавать кадры выбранного окна в Google', 'activity_send_remote_images')}
         ${contextNumber('Интервал анализа, с', 'live_analysis_seconds', 2, 120)}
         ${contextNumber('Громкость Live Audio', 'live_volume', 0, 1, .05)}
         ${contextFlag('Инициативные комментарии', 'live_proactive')}
@@ -940,29 +960,25 @@ async function busy(key, fn) {
 
 const ACTIONS = {
   save: saveAll,
-  async capturechoices() {
-    try {
-      const { windows } = await api('/api/activity/windows');
-      const list = $('[data-capture-choices]');
-      if (!list) return;
-      list.hidden = false;
-      list.innerHTML = windows.length ? windows.map(w =>
-        `<button class="btn" type="button" data-ctl="focus_capture_start" data-value="${esc(w.id)}">${esc(w.title)}</button>`).join(' ')
-        : 'Нет открытых окон из списка разрешённых EXE.';
-    } catch (error) { toast(error.message, { bad: true }); }
-  },
   async contextpreview() {
     try {
       const { preview } = await api('/api/activity/preview', { method: 'POST', body: {} });
       const pre = $('[data-context-preview]');
-      if (!pre) return;
       const image = $('[data-context-image]');
-      const { image_preview: frame, ...data } = preview || {};
+      const { image_preview: frame, frame_id: frameId, ...data } = preview || {};
+      if (!image) return;
       image.hidden = !frame;
-      if (frame) image.src = frame;
-      else image.removeAttribute('src');
-      pre.hidden = false;
-      pre.textContent = preview ? JSON.stringify(data, null, 2) : 'Доступного контекста пока нет.';
+      if (frame) {
+        image.src = frame;
+        image.dataset.frameId = frameId;
+      } else {
+        image.removeAttribute('src');
+        if (!pre) toast('Сейчас нет доступного кадра активного окна.');
+      }
+      if (pre) {
+        pre.hidden = false;
+        pre.textContent = preview?.context ? JSON.stringify(data, null, 2) : 'Доступного контекста пока нет.';
+      }
     } catch (error) { toast(error.message, { bad: true }); }
   },
   revert: revertAll,
@@ -1086,7 +1102,6 @@ document.addEventListener('click', async (e) => {
   const d = t.dataset;
   if (d.act && ACTIONS[d.act]) { e.preventDefault(); ACTIONS[d.act](t); return; }
   if (d.ctl) {
-    if (d.ctl === 'focus_capture_start') t.closest('[data-capture-choices]')?.setAttribute('hidden', '');
     control(d.ctl, d.value);
     return;
   }
@@ -1194,6 +1209,11 @@ async function poll() {
     S.conn = false;
   }
   renderNav();
+  const image = $('[data-context-image]');
+  if (image && (!S.conn || image.dataset.frameId !== String(S.status?.focus?.sources?.preview_frame_id))) {
+    image.hidden = true;
+    image.removeAttribute('src');
+  }
   if (['focus', 'intervention'].includes(S.route) && S.cfg) {
     const section = $('[data-focus-live]');
     if (section) {
@@ -1206,6 +1226,8 @@ async function poll() {
   } else if (S.route === 'activity' && S.cfg) {
     const section = $('[data-activity-live]');
     if (section) setHtml(section, activityStatus(S.status));
+    const capture = $('[data-capture-diagnostics]');
+    if (capture) setHtml(capture, captureDiagnostics(S.status));
   } else if (S.route === 'diagnostics' && S.cfg) {
     const section = $('[data-diagnostics-live]');
     if (section) setHtml(section, liveStatus(S.status));
@@ -1213,13 +1235,6 @@ async function poll() {
     if ((!S.status?.sprint || S.status.sprint.state !== 'ACTIVE') && pre) {
       pre.hidden = true;
       pre.textContent = '';
-    }
-    if (!S.status?.focus?.sources?.armed) {
-      const image = $('[data-context-image]');
-      if (image) {
-        image.hidden = true;
-        image.removeAttribute('src');
-      }
     }
   } else if (['current', 'history'].includes(S.route) && S.cfg) {
     const section = $('[data-sprint-live]');

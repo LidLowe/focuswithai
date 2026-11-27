@@ -231,7 +231,6 @@ class Panel:
         r.add_get('/', self.index)
         r.add_static('/static/', WEB_DIR)
         r.add_get('/api/status', self.status)
-        r.add_get('/api/activity/windows', self.capture_choices)
         r.add_get('/api/activity/preview', self.context_preview)
         r.add_post('/api/activity/preview', self.context_preview)
         r.add_post('/api/activity/browser', self.browser_event)
@@ -318,14 +317,6 @@ class Panel:
         body = await self._body(request)
         self._live().control(body.get('action'), body.get('value'))
         return _json({'ok': True})
-
-    @_handler
-    async def capture_choices(self, request):
-        focus = self._live().focus
-        if not focus or not focus.phase().active or not focus.acquisition.enabled:
-            return _json({'windows': []})
-        acq = focus.acquisition
-        return _json({'windows': await asyncio.to_thread(acq.windows.capture_choices, acq.privacy)})
 
     @_handler
     async def context_preview(self, request):

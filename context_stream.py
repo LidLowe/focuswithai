@@ -86,7 +86,8 @@ class ContextStream:
             self.put(kind, data)
         if 'ACTIVITY_DURATION' in self.pending:
             self.pending.move_to_end('ACTIVITY_DURATION')
-        if self.last_duration is None or now - self.last_duration >= interval:
+        image_changed = 'SCREEN_FRAME' in changed
+        if self.last_duration is None or image_changed or now - self.last_duration >= interval:
             self.last_duration = now
             self.put('ACTIVITY_DURATION', facts['activity_seconds'])
             self.put('RECENT_ACTIVITY', {

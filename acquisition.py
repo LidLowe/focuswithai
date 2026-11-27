@@ -6,7 +6,7 @@ import ntpath
 import threading
 import time
 
-from activity_context import BROWSERS, CHROME, ContextAggregator, Privacy, clean, items, setting
+from activity_context import BROWSERS, ContextAggregator, Privacy, clean, items, setting
 
 
 def background(function, *args):
@@ -37,54 +37,53 @@ class Acquisition:
         self.windows = windows
         self.privacy = Privacy(config)
         self.context = ContextAggregator(self.privacy)
-        self.enabled = bool(windows and config.get('capture_enabled'))
         self.has_capture = bool(windows and importlib.util.find_spec('PIL'))
-        self.mode = config.get('capture_mode', 'event')
-        self.interval = setting(config, 'capture_interval', 3, 120)
+        self.interval = setting(config, 'capture_interval', 2, 120)
         self.dimensions = tuple(int(setting(config, key, 160, 1600)) for key in ('capture_width', 'capture_height'))
         self.quality = int(setting(config, 'capture_quality', 35, 95))
         self.media = windows.MediaMonitor() if windows and config.get('media_context_enabled') else None
         self.capture_job = self.media_job = self.apps_job = None
         self.next_capture = self.next_media = self.next_apps = 0
         self.capture_epoch = 0
-        self.armed = False
-        self.selected = None
-        self.capture_error = None
+        self.capture_sprint = None
+        self.capture_skip = 'disabled'
+        self.frames_captured = 0
+        self.last_capture = None
+        self.last_size = None
         self.media_error = None
         self.apps = []
         self.allowed_apps = set(items(config, 'context_allowed_apps'))
         self.capture_backoff = 1
         self.active = False
 
-    def arm(self, selection):
-        if not self.active or not self.enabled or not self.has_capture or not self.privacy.capture_apps:
-            raise ValueError('Нужны активный спринт, Pillow и разрешённый полный путь к рабочему приложению.')
-        candidates = self.windows.capture_choices(self.privacy)
-        choice = next((w for w in candidates if w['id'] == selection), None)
-        if not choice:
-            raise ValueError('Выбери доступное разрешённое рабочее окно.')
+    def start_capture(self, sprint_id):
+        if not self.has_capture:
+            raise ValueError('Автозахват требует Windows и Pillow.')
+        if self.capture_sprint == sprint_id:
+            return
         self.stop_capture()
-        self.selected = (choice['handle'], choice['pid'])
-        self.armed = True
-        self.next_capture = time.monotonic() + 2
-        self.capture_error = None
+        self.capture_sprint = sprint_id
+        self.capture_skip = None
 
     def stop_capture(self):
-        self.armed = False
-        self.selected = None
-        self.capture_epoch += 1
-        self.context.frame = self.context.sent_frame = self.context.frame_checked_at = None
+        self.capture_sprint = None
+        self.capture_skip = 'disabled'
+        self.reset_frame()
 
-    def suspend(self, *, keep_selection=False):
+    def reset_frame(self):
+        self.capture_epoch += 1
+        self.next_capture = 0
+        self.capture_backoff = 1
+        self.context.frame = self.context.frame_checked_at = None
+
+    def suspend(self):
         self.active = False
+        self.reset_frame()
+        if self.capture_sprint:
+            self.capture_skip = 'sprint_inactive'
         if self.apps_job:
             self.apps_job.cancel()
             self.apps_job = None
-        if keep_selection:
-            self.capture_epoch += 1
-            self.next_capture = 0
-        else:
-            self.stop_capture()
         self.context.reset()
         if self.media_job:
             self.media_job.cancel()
@@ -116,12 +115,11 @@ class Acquisition:
         self.active = True
         if self.context.browser and now - self.context.browser['seen'] >= 45:
             self.context.browser = None
-        switched = window != self.context.window
-        if switched and self.armed and self.selected and (window.handle, window.pid) != self.selected:
-            self.capture_epoch += 1
+        if window != self.context.window:
+            self.reset_frame()
+            if self.capture_sprint:
+                self.capture_skip = 'foreground_changed'
         self.context.sample(now, window)
-        if switched:
-            self.capture_backoff = 1
         if self.apps_job and self.apps_job.done():
             value, _ = self.apps_job.result()
             self.apps_job = None
@@ -143,53 +141,63 @@ class Acquisition:
             self.next_media = now + 15
             self.media_job = asyncio.create_task(asyncio.wait_for(self.media.sample(), 4))
 
+        self.sample_frame(now, window, idle)
+
+    def sample_frame(self, now, window, idle):
         if self.capture_job and self.capture_job.done():
-            value, error = self.capture_job.result()
+            result, error = self.capture_job.result()
+            frame, reason = result if result is not None else (None, 'capture_failed')
             self.capture_job = None
-            if self.armed and self.job_epoch == self.capture_epoch and self.job_window == window:
-                self.capture_error = error or (None if value else 'window_unavailable')
-                # A successful identical capture keeps the existing frame fresh without re-sending it.
-                self.context.frame_checked_at = value.captured_at if value else None
-                if value and value.differs(self.context.frame):
-                    self.context.frame = value
-                    self.capture_backoff = 1
-                else:
-                    self.capture_backoff = min(4, self.capture_backoff * 2)
-                if not value:
-                    self.context.frame = None
-                    if ntpath.basename(window.executable).casefold() == CHROME:
+            if self.job_epoch == self.capture_epoch:
+                self.capture_skip = 'capture_failed' if error else reason
+                self.context.frame_checked_at = frame.captured_at if frame else None
+                if frame:
+                    self.frames_captured += 1
+                    self.last_capture = time.time()
+                    self.last_size = {'width': frame.width, 'height': frame.height, 'bytes': len(frame.data)}
+                    if frame.differs(self.context.frame):
+                        self.context.frame = frame
                         self.capture_backoff = 1
-        if idle or not self.armed or not self.privacy.capture_allowed(window):
+                        self.next_capture = now + self.interval
+                    else:
+                        self.capture_skip = 'unchanged'
+                        self.capture_backoff = min(4, self.capture_backoff * 2)
+                        self.next_capture = now + min(120, self.interval * self.capture_backoff)
+                else:
+                    self.context.frame = None
+                    self.capture_backoff = 1
+
+        if not self.capture_sprint:
             return
-        if self.selected is None:
+        if idle or not self.privacy.capture_allowed(window):
+            if self.context.frame or self.capture_job and self.job_epoch == self.capture_epoch:
+                self.reset_frame()
+            self.capture_skip = 'idle' if idle else 'window_excluded'
             return
-        if self.selected != (window.handle, window.pid) or self.capture_job or now < self.next_capture:
+        if self.capture_job or now < self.next_capture:
             return
-        self.job_window, self.job_epoch = window, self.capture_epoch
-        self.next_capture = now + (self.interval if self.mode == 'periodic'
-                                   else min(120, self.interval * self.capture_backoff))
-        args = (window, self.dimensions, self.quality)
-        if ntpath.basename(window.executable).casefold() == CHROME:
-            args += (self.privacy.browser_capture_allowed,)
-        self.capture_job = background(self.windows.capture_window, *args)
+        self.job_epoch = self.capture_epoch
+        self.next_capture = now + min(120, self.interval * self.capture_backoff)
+        self.capture_job = background(self.windows.capture_window, window, self.dimensions, self.quality,
+                                      self.privacy.browser_capture_allowed)
 
     def browser_context_available(self, now, *, send_images):
-        return bool(self.context.browser or (send_images and self.armed and self.context.current_frame(now)))
+        return bool(self.context.browser or (send_images and self.capture_sprint and self.context.current_frame(now)))
 
     def foreground_is_current(self):
         return not self.windows or self.windows.foreground() == self.context.window
 
     def status(self):
-        frame = self.context.frame
         browser = self.context.browser
+        frame = self.context.current_frame(time.monotonic())
         tab = None
         if self.active and browser:
             tab = {key: browser[key] for key in ('domain', 'title', 'tab_title')}
             tab['seconds'] = max(0, int(time.monotonic() - browser['started']))
-        return {'enabled': self.enabled, 'available': self.has_capture, 'armed': self.armed,
-                'capturing': bool(self.armed and self.selected and self.privacy.capture_allowed(self.context.window)
-                                  and self.selected == (self.context.window.handle, self.context.window.pid)),
-                'last_frame': {'width': frame.width, 'height': frame.height} if frame else None,
-                'capture_error': self.capture_error, 'media_error': self.media_error,
+        return {'available': self.has_capture, 'capture_active': bool(self.active and self.capture_sprint),
+                'capture_enabled': bool(self.capture_sprint), 'frames_captured': self.frames_captured,
+                'last_capture': self.last_capture, 'last_size': self.last_size,
+                'preview_frame_id': frame.captured_at if frame else None,
+                'capture_skip': self.capture_skip, 'media_error': self.media_error,
                 'apps': self.apps, 'browser': tab,
                 'media': self.context.media[1] if self.active and self.context.media else None}

@@ -16,49 +16,68 @@ def facts(title='Synthetic editor'):
 
 
 class AcquisitionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_only_explicit_window_and_allowed_app_names(self):
-        path = r'C:\Work\editor.exe'
+    async def test_auto_capture_follows_foreground_and_discards_a_late_frame(self):
+        import threading
+        ide = Foreground(1, 2, 'Synthetic editor', r'C:\Work\editor.exe')
+        chrome = Foreground(2, 3, 'Synthetic page - Google Chrome', r'C:\Chrome\chrome.exe')
+        excluded = Foreground(3, 4, 'Private window', r'C:\Work\excluded.exe')
         windows = Mock()
-        windows.capture_choices.return_value = [dict(id='8-2', handle=8, pid=2)]
-        windows.user_apps.return_value = ['editor.exe', 'demo.exe', 'signal.exe']
-        source = Acquisition({'capture_enabled': True, 'capture_apps': [path],
-                              'context_allowed_apps': ['editor.exe', 'signal.exe']}, windows)
-        source.has_capture = source.active = True
-        with self.assertRaises(ValueError):
-            source.arm('7-2')
-        source.arm('8-2')
-        now = time.monotonic() + 3
-        source.sample(now, Foreground(7, 2, 'other', path))
-        await source.apps_job
-        windows.capture_window.assert_not_called()
-        source.sample(now + 1, Foreground(8, 2, 'editor', path))
+        windows.user_apps.return_value = ['editor.exe', 'demo.exe']
+        release = threading.Event()
+
+        def capture(window, dimensions, quality, check):
+            if window == ide:
+                release.wait(2)
+            return Frame(window.executable.encode(), bytes(100), 80, 80, time.monotonic()), None
+
+        windows.capture_window.side_effect = capture
+        source = Acquisition({'activity_excluded_apps': ['excluded.exe'],
+                              'context_allowed_apps': ['editor.exe']}, windows)
+        source.has_capture = True
+        now = time.monotonic()
+        source.sample(now, ide)
+        self.assertIsNone(source.capture_job)
+        source.start_capture('sprint')
+        source.sample(now, ide)
+        old_job = source.capture_job
+        source.sample(now + .1, chrome)
+        release.set()
+        await old_job
+        source.sample(now + .2, chrome)
+        self.assertIsNone(source.context.frame)
         await source.capture_job
-        windows.capture_window.assert_called_once()
+        source.sample(now + .3, chrome)
+        self.assertEqual(source.context.frame.data, chrome.executable.encode())
+        self.assertEqual(source.frames_captured, 1)
         self.assertEqual(source.context.user_apps, ['editor.exe'])
-        source.suspend()
-        self.assertFalse(source.armed)
-        self.assertFalse(source.context.user_apps)
+        self.assertEqual(windows.capture_window.call_args.args[1:3], ((1280, 720), 80))
+        source.sample(now + .4, excluded)
+        self.assertIsNone(source.context.frame)
+        self.assertIsNone(source.capture_job)
+        self.assertEqual(source.capture_skip, 'window_excluded')
+        source.stop_capture()
+        source.sample(now + 4, ide)
+        self.assertIsNone(source.capture_job)
 
-
-    async def test_unchanged_chrome_frame_stays_valid_after_recheck(self):
+    async def test_unchanged_frame_stays_valid_and_slows_captures(self):
         chrome = Foreground(4, 5, 'Synthetic exercise - Google Chrome', r'C:\Chrome\chrome.exe')
         windows = Mock()
-        windows.capture_choices.return_value = [dict(id='4-5', handle=4, pid=5)]
         windows.user_apps.return_value = []
         now = time.monotonic()
         first = Frame(b'jpeg', bytes(100), 80, 80, now - 60)
         refreshed = Frame(b'jpeg', bytes(100), 80, 80, now)
-        windows.capture_window.return_value = refreshed
-        source = Acquisition({'capture_enabled': True, 'capture_apps': [chrome.executable]}, windows)
-        source.has_capture = source.active = True
-        source.arm('4-5')
+        windows.capture_window.return_value = refreshed, None
+        source = Acquisition({}, windows)
+        source.has_capture = True
+        source.start_capture('sprint')
         source.context.sample(now, chrome)
         source.context.frame = first
-        source.next_capture = 0
         source.sample(now, chrome)
         await source.capture_job
         source.sample(now + .1, chrome)
         self.assertIs(source.context.current_frame(now + .1), first)
+        self.assertEqual(source.next_capture, now + .1 + 4)
+        self.assertEqual(source.capture_skip, 'unchanged')
         self.assertTrue(source.browser_context_available(now + .1, send_images=True))
         self.assertFalse(source.browser_context_available(now + .1, send_images=False))
         source.suspend()
@@ -111,22 +130,24 @@ class ChromeCaptureTests(unittest.TestCase):
               patch('PIL.ImageGrab.grab', return_value=image) as grab):
             for address in ('', login):
                 read_address.return_value = address
-                self.assertIsNone(capture_window(chrome, (80, 80), 72, privacy.browser_capture_allowed))
+                self.assertIsNone(capture_window(chrome, (80, 80), 72, privacy.browser_capture_allowed)[0])
                 grab.assert_not_called()
 
             read_address.side_effect = [safe, login]
-            self.assertIsNone(capture_window(chrome, (80, 80), 72, privacy.browser_capture_allowed))
+            self.assertIsNone(capture_window(chrome, (80, 80), 72, privacy.browser_capture_allowed)[0])
             grab.assert_called_once_with(window=chrome.handle)
             grab.reset_mock()
 
             read_address.side_effect = [safe, safe]
-            frame = capture_window(chrome, (80, 80), 72, privacy.browser_capture_allowed)
+            frame, reason = capture_window(chrome, (80, 80), 72, privacy.browser_capture_allowed)
             self.assertTrue(frame.data.startswith(b'\xff\xd8'))
             grab.assert_called_once_with(window=chrome.handle)
 
             grab.reset_mock()
             sensitive.return_value = True
-            self.assertIsNone(capture_window(chrome, (80, 80), 72, privacy.browser_capture_allowed))
+            read_address.side_effect = None
+            read_address.return_value = safe
+            self.assertIsNone(capture_window(chrome, (80, 80), 72, privacy.browser_capture_allowed)[0])
             grab.assert_not_called()
 
 

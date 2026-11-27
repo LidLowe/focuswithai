@@ -106,14 +106,17 @@ class FocusController:
             'warning': bool(engine and engine.current_warning(now)),
         }
 
-    def suspend(self, reason='observation_reset', *, keep_selection=False):
+    def suspend(self, reason='observation_reset'):
         self.live.session.hold(reason)
         if self.confirmed:
             self.stop_audio()
         self.confirmed = False
         if self.intervention:
             self.intervention.clear()
-        self.acquisition.suspend(keep_selection=keep_selection)
+        sprint = self.phase().sprint
+        if self.acquisition.capture_sprint != (sprint or {}).get('id'):
+            self.acquisition.stop_capture()
+        self.acquisition.suspend()
         self.decision.reset()
         self.signature = self.next_action = None
         self.was_private = False
@@ -125,13 +128,15 @@ class FocusController:
 
     def context_preview(self, include_image=False):
         phase = self.phase()
-        stream = self.live.session.stream
-        if not phase.active or not stream.stamp or not self.live.current(stream.stamp):
+        if not phase.active or not self.acquisition.foreground_is_current():
             return None
-        data = {'context': stream.preview(), 'model': self.live.session.model}
-        frame = stream.latest.get('SCREEN_FRAME')
-        if include_image and frame and self.acquisition.armed:
+        stream = self.live.session.stream
+        data = {'context': stream.preview() if stream.stamp and self.live.current(stream.stamp) else None,
+                'model': self.live.session.model}
+        frame = self.acquisition.context.current_frame(time.monotonic())
+        if include_image and frame and self.acquisition.capture_sprint == phase.sprint['id']:
             data['image_preview'] = 'data:image/jpeg;base64,' + base64.b64encode(frame.data).decode('ascii')
+            data['frame_id'] = frame.captured_at
         return data
 
     def action(self, action, value=None):
@@ -141,9 +146,10 @@ class FocusController:
             self.live.request(value)
             return
         if action == 'capture_start':
-            if not self.hud or not self.hud.hotkey:
-                raise ValueError('Для захвата нужен индикатор HUD и доступная клавиша Ctrl+Shift+F9.')
-            self.acquisition.arm(value)
+            phase = self.phase()
+            if not phase.active:
+                raise ValueError('Начни спринт, чтобы включить автозахват.')
+            self.acquisition.start_capture(phase.sprint['id'])
             return
         if action == 'capture_stop':
             self.acquisition.stop_capture()
@@ -219,11 +225,11 @@ class FocusController:
             window, idle = self.sample
             private = self.acquisition.privacy.excluded(window)
             if private and not self.was_private:
-                self.suspend('excluded_window', keep_selection=True)
+                self.suspend('excluded_window')
                 self.sample = window, idle
                 self.next_sample = now + 1
             self.was_private = private
-            self.acquisition.sample(now, window, idle=idle)
+            self.acquisition.sample(now, window, idle=idle or not self.use_ai())
             context = self.acquisition.context
             signature = (phase.context, window, (context.browser['domain'], context.browser['title']) if context.browser else None)
             if signature != self.signature:
@@ -241,8 +247,8 @@ class FocusController:
                 blocked = ('browser_context_unavailable', 'Ожидаю разрешённый кадр Chrome или данные рабочей вкладки.')
             elif idle:
                 blocked = ('idle', 'Давно не было мыши или клавиатуры.')
-            elif not window.title:
-                blocked = ('missing_window_title', 'У активного окна нет заголовка.')
+            elif not window.executable and not window.title:
+                blocked = ('missing_window', 'Не удалось определить активное окно.')
             elif now - context.entered < 2 or not self.acquisition.foreground_is_current():
                 blocked = ('window_settling', 'Ожидаю актуальный контекст окна.')
             if blocked:

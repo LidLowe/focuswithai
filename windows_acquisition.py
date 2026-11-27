@@ -11,7 +11,7 @@ import win32gui
 import win32process
 from pywintypes import error as WinError
 
-from activity_context import Frame, PRIVATE_TEXT, clean
+from activity_context import BROWSERS, Frame, PRIVATE_TEXT, clean
 from focus_windows import browser_address, foreground
 
 
@@ -46,57 +46,41 @@ def sensitive_controls(hwnd):
         comtypes.CoUninitialize()
 
 
-def capture_window(window, dimensions, quality, browser_check=None):
+def capture_window(window, dimensions, quality, browser_check):
     from PIL import ImageGrab
 
     affinity = wintypes.DWORD()
-    if (foreground() != window or win32gui.IsIconic(window.handle) or
-            (_affinity(window.handle, ctypes.byref(affinity)) and affinity.value)
-            or sensitive_controls(window.handle)):
-        return None
-    if browser_check is not None:
+    if foreground() != window or win32gui.IsIconic(window.handle):
+        return None, 'foreground_changed'
+    if _affinity(window.handle, ctypes.byref(affinity)) and affinity.value:
+        return None, 'protected_window'
+
+    browser = ntpath.basename(window.executable).casefold() in BROWSERS
+    if browser:
         address = browser_address(window, for_capture=True)
         if not browser_check(address):
-            return None
+            return None, 'browser_unverified'
+    if sensitive_controls(window.handle):
+        return None, 'sensitive_controls'
     left, top, right, bottom = win32gui.GetWindowRect(window.handle)
     if not 0 < (right - left) * (bottom - top) <= 20_000_000:
-        return None
+        return None, 'invalid_dimensions'
     image = ImageGrab.grab(window=window.handle)
-    if foreground() != window or sensitive_controls(window.handle):
-        return None
-    if browser_check is not None and browser_address(window, for_capture=True) != address:
-        return None
+    if foreground() != window:
+        return None, 'foreground_changed'
+    # Tabs can navigate without changing the native title or window handle.
+    if browser and browser_address(window, for_capture=True) != address:
+        return None, 'browser_changed'
     image.thumbnail(dimensions)
     if image.width < 40 or image.height < 40:
-        return None
+        return None, 'invalid_dimensions'
     gray = image.convert('L').resize((48, 32))
     low, high = gray.getextrema()
     if high - low < 8:
-        return None
+        return None, 'blank_frame'
     output = io.BytesIO()
     image.convert('RGB').save(output, 'JPEG', quality=quality)
-    return Frame(output.getvalue(), gray.tobytes(), image.width, image.height, time.monotonic())
-
-
-def capture_choices(privacy):
-    from focus_meter import Foreground
-    from focus_windows import executable_for_pid
-    choices = []
-
-    def visit(hwnd, unused):
-        try:
-            if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd) or len(choices) >= 64:
-                return True
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            window = Foreground(hwnd, pid, win32gui.GetWindowText(hwnd), executable_for_pid(pid))
-            if pid != os.getpid() and window.title and privacy.capture_allowed(window):
-                choices.append(dict(id=f'{hwnd}-{pid}', handle=hwnd, pid=pid, title=clean(window.title)))
-        except (OSError, WinError):
-            pass
-        return True
-
-    win32gui.EnumWindows(visit, None)
-    return choices
+    return Frame(output.getvalue(), gray.tobytes(), image.width, image.height, time.monotonic()), None
 
 
 def user_apps():

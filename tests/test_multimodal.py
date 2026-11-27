@@ -22,8 +22,7 @@ def response(label='OFF_TASK', relevance=.1, confidence=.93):
 class ObservationTests(unittest.TestCase):
     def test_exclusions_and_approved_window(self):
         approved = r'C:\Work\Editor.exe'
-        privacy = Privacy({'capture_apps': [approved, r'C:\Chrome\chrome.exe'],
-                           'activity_excluded_windows': ['private document'],
+        privacy = Privacy({'activity_excluded_windows': ['private document'],
                            'browser_context_domains': ['docs.example.org']})
         self.assertTrue(privacy.capture_allowed(Foreground(1, 2, 'Lab notes', approved)))
         self.assertFalse(privacy.capture_allowed(Foreground(1, 2, 'Sign in', approved)))
@@ -63,9 +62,8 @@ class ObservationTests(unittest.TestCase):
         self.assertEqual(facts['activity_seconds'], 3)
         self.assertEqual(len(facts['recent_switches']), 5)
         self.assertIs(sent, frame)
-        context.sent_frame = frame
         context.frame = Frame(b'nearly same', b'\x07' * 100, 640, 400, 13)
-        self.assertIsNone(context.snapshot(16, '{"goal":"VLANs"}', 12)[1])
+        self.assertFalse(context.snapshot(16, '{"goal":"VLANs"}', 12)[1].differs(frame))
         context.frame = Frame(b'different', b'\x30' * 100, 640, 400, 13)
         self.assertIsNotNone(context.snapshot(16, '{"goal":"VLANs"}', 12)[1])
         context.sample(17, Foreground(2, 1, 'Incognito banking', 'chrome.exe'))
@@ -150,3 +148,20 @@ class ObservationTests(unittest.TestCase):
                 config = load_config(path)
             self.assertFalse(config['activity_allow_remote'])
             self.assertFalse(config['activity_send_remote_images'])
+
+    def test_configuration_migration_removes_manual_capture_and_preserves_image_consent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.json'
+            original = {'schema_version': 2, 'capture_enabled': True, 'capture_mode': 'event',
+                        'capture_apps': [r'C:\Work\Editor.exe'], 'activity_send_remote_images': True,
+                        'activity_allow_remote': True, 'capture_width': 1024}
+            path.write_text(json.dumps(original), encoding='utf-8')
+            with patch('config_store.read_secret', return_value=''):
+                config = load_config(path)
+            self.assertNotIn('capture_enabled', config)
+            self.assertNotIn('capture_mode', config)
+            self.assertNotIn('capture_apps', config)
+            self.assertTrue(config['activity_send_remote_images'])
+            self.assertTrue(config['activity_allow_remote'])
+            self.assertEqual(config['capture_width'], 1024)
+            self.assertEqual(json.loads(path.with_name('config.pre-auto-capture.json').read_text()), original)

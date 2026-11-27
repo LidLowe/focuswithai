@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+import sys
 import tempfile
 import time
 import unittest
@@ -14,7 +15,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from context_stream import ContextStream
 from activity_context import Frame
-from live_session import LiveSetupError
+from live_session import LivePolicyClose, LiveSession, LiveSetupError
 from panel import Panel, probe_gemini_live
 from focus_meter import Foreground
 from sprints import SprintManager
@@ -173,7 +174,6 @@ class GeminiTransportTests(unittest.IsolatedAsyncioTestCase):
 
 
     async def test_goaway_reconnects_without_replaying_blocked_context(self):
-        from live_session import LiveSession
         handshakes = []
         requests = []
 
@@ -225,6 +225,88 @@ class GeminiTransportTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     await session.close()
 
+    async def test_policy_close_before_setup_is_a_configuration_error(self):
+        async def endpoint(request):
+            socket = web.WebSocketResponse()
+            await socket.prepare(request)
+            await socket.receive_json()
+            await socket.close(code=1008, message=b'Fixture private details')
+            return socket
+
+        upstream = web.Application()
+        upstream.router.add_get('/ws', endpoint)
+        config = {'activity_allow_remote': True, 'google_assistant_api_key': 'fixture'}
+        async with TestServer(upstream) as server:
+            with patch('gemini_live.ENDPOINT', str(server.make_url('/ws'))):
+                result = await probe_gemini_live(config, 'connection')
+        detail = result['stages']['connection']['detail']
+        self.assertIn('до setupComplete', detail)
+        self.assertNotIn('Fixture private details', detail)
+        self.assertFalse(result['ok'])
+
+    async def test_established_policy_close_waits_for_a_fresh_allowed_observation(self):
+        handshakes = []
+        expire = asyncio.Event()
+
+        async def endpoint(request):
+            socket = web.WebSocketResponse()
+            await socket.prepare(request)
+            await socket.receive_json()
+            handshakes.append(socket)
+            await socket.send_json({'setupComplete': {}})
+            if len(handshakes) == 1:
+                await expire.wait()
+                await socket.close(code=1008, message=b'Session timed out due to inactivity. Private fixture.')
+                return socket
+            async for message in socket:
+                wire = json.loads(message.data)
+                if 'clientContent' in wire:
+                    await socket.send_json({'toolCall': {'functionCalls': [{
+                        'id': 'fixture', 'name': REPORT, 'args': {
+                            'assessment': ASSESSMENT, 'commentary_kind': 'NONE', 'commentary_text': '',
+                        },
+                    }]}})
+                else:
+                    await socket.send_json({'serverContent': {'turnComplete': True}})
+            return socket
+
+        upstream = web.Application()
+        upstream.router.add_get('/ws', endpoint)
+        config = {'activity_allow_remote': True, 'google_assistant_api_key': 'fixture'}
+        session = LiveSession(config, lambda message: None, lambda: None, lambda: GeminiLiveTransport(config))
+        allowed = {'application': 'editor.exe', 'window_title': 'Synthetic exercise', 'activity_seconds': 4,
+                   'browser': None, 'media': None, 'user_apps': []}
+        async with TestServer(upstream) as server:
+            with patch('gemini_live.ENDPOINT', str(server.make_url('/ws'))):
+                try:
+                    session.start('sprint', {'goal': 'Synthetic exercise'})
+                    await until(lambda: session.connection_state == 'CONNECTED')
+                    session.hold('pause', paused=True)
+                    expire.set()
+                    await until(lambda: session.connection_state == 'RECONNECTING')
+                    self.assertIn('бездействия', session.error)
+                    self.assertNotIn('Private fixture', session.error)
+                    self.assertEqual(session.analysis_state, 'PAUSED')
+                    await asyncio.sleep(1.1)
+                    self.assertEqual(len(handshakes), 1)
+                    session.observe(allowed, None, 'new window', time.monotonic())
+                    await until(lambda: session.result is not None)
+                    self.assertEqual(session.connection_state, 'CONNECTED')
+                    self.assertEqual(len(handshakes), 2)
+                finally:
+                    expire.set()
+                    await session.close()
+
+    def test_policy_close_distinguishes_access_errors_from_unclassified_runtime_closes(self):
+        transport = GeminiLiveTransport({'activity_allow_remote': True, 'google_assistant_api_key': 'fixture'})
+        transport.setup_complete = True
+        access = transport._policy_close('Permission denied. private fixture')
+        unknown = transport._policy_close('Private fixture')
+        self.assertIsInstance(access, LiveSetupError)
+        self.assertIsInstance(unknown, LivePolicyClose)
+        self.assertFalse(unknown.expected_expiry)
+        self.assertNotIn('Private fixture', str(unknown))
+
     async def test_probe_exercises_distinct_connection_classification_and_audio_stages(self):
         turns = []
 
@@ -272,14 +354,14 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
               patch('logging.basicConfig'), patch('signal.signal')):
             import main
 
-        ide = Foreground(1, 2, 'Synthetic programming exercise', 'example-editor.exe')
+        ide = Foreground(1, 2, 'Synthetic programming exercise', r'C:\Work\example-editor.exe')
         browser = Foreground(2, 3, 'Synthetic programming exercise - Google Chrome', r'C:\Chrome\chrome.exe')
         protected_tab = Foreground(browser.handle, browser.pid, 'Sign in - Google Chrome', browser.executable)
         private = Foreground(3, 4, 'Excluded application fixture', 'secret-example.exe')
         foreground = ide
         config = {**config, 'activity_excluded_apps': [private.executable], 'focus_meter_enabled': True}
         if chrome_image:
-            config.update(capture_enabled=True, capture_apps=[browser.executable], activity_send_remote_images=True)
+            config['activity_send_remote_images'] = True
         with tempfile.TemporaryDirectory() as tmp:
             store = SprintManager(Path(tmp) / 'sprints.json')
             with (patch.object(main, 'config', config), patch.object(main, 'SprintManager', return_value=store),
@@ -291,14 +373,11 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
                 acquisition = tracker.acquisition
 
                 def capture(window, dimensions, quality, allow_address):
-                    assert window == browser and allow_address('https://docs.example.org/exercise')
-                    return Frame(chrome_image, b'fingerprint', 320, 160, time.monotonic())
+                    assert window in (ide, browser) and allow_address('https://docs.example.org/exercise')
+                    return Frame(chrome_image, b'fingerprint', 320, 160, time.monotonic()), None
 
                 acquisition.windows = SimpleNamespace(
                     foreground=lambda: foreground, user_apps=lambda: [], capture_window=capture,
-                    capture_choices=lambda privacy: [
-                        {'id': '2-3', 'handle': browser.handle, 'pid': browser.pid},
-                    ],
                 )
                 tracker.monitor.get_window = lambda: foreground
                 tracker.monitor.get_idle = lambda: 0
@@ -312,13 +391,19 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(response.status, 200, await response.text())
                             return await response.json()
 
-                        async def check_ide():
+                        async def control(action):
+                            response = await client.post('/api/control', json={'action': action}, headers={'X-Panel': '1'})
+                            self.assertEqual(response.status, 200, await response.text())
+
+                        async def check_ide(*, expect_frame=False):
                             nonlocal foreground
                             previous = session.last_success
                             foreground = ide
                             tracker.next_sample = 0
                             tracker._tick(time.monotonic())
-                            tracker.acquisition.context.entered -= 3
+                            if expect_frame:
+                                await acquisition.capture_job
+                            acquisition.context.entered -= 3
                             tracker._tick(time.monotonic())
                             await until(lambda: session.result and session.last_success != previous,
                                         timeout=session.response_timeout)
@@ -347,9 +432,8 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(session.connected, connected_at)
                             await check_ide()
                         if chrome_image:
-                            acquisition.has_capture = acquisition.enabled = True
-                            acquisition.arm('2-3')
-                            acquisition.next_capture = 0
+                            acquisition.has_capture = True
+                            await control('focus_capture_start')
                             foreground = browser
                             tracker.next_sample = 0
                             tracker._tick(time.monotonic())
@@ -359,6 +443,9 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
                             tracker._tick(time.monotonic())
                             self.assertEqual(session.analysis_state, 'WAITING_FOR_CONTEXT')
                             self.assertIsNone(acquisition.context.browser)
+                            self.assertEqual(session.frames, 0)
+                            self.assertEqual(acquisition.frames_captured, 1)
+                            self.assertIn('image_preview', tracker.context_preview(include_image=True))
 
                             previous = session.last_success
                             tracker.live.allow_images = True
@@ -377,8 +464,13 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(session.connected, connected_at)
                             self.assertIsNone(acquisition.context.frame)
                             self.assertIsNone(session.stream.latest.get('SCREEN_FRAME'))
-                            self.assertTrue(acquisition.armed)
-                            await check_ide()
+                            self.assertEqual(acquisition.capture_sprint, sprint_id)
+                            await check_ide(expect_frame=True)
+                            self.assertEqual(session.frames, 2)
+                            self.assertIsNotNone(session.last_frame_sent)
+                            await control('focus_capture_stop')
+                            self.assertIsNone(acquisition.context.frame)
+                            self.assertEqual(session.connection_state, 'CONNECTED')
                         await command('pause', id=sprint_id)
                         self.assertEqual(session.analysis_state, 'PAUSED')
                         self.assertEqual(session.connected, connected_at)
@@ -442,7 +534,7 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(requests), 7)
         images = [part['inlineData'] for wire in requests for turn in wire['clientContent']['turns']
                   for part in turn['parts'] if 'inlineData' in part]
-        self.assertEqual(images, [{'mimeType': 'image/jpeg', 'data': base64.b64encode(b'fixture JPEG').decode()}])
+        self.assertEqual(images, [{'mimeType': 'image/jpeg', 'data': base64.b64encode(b'fixture JPEG').decode()}] * 2)
         wire_text = json.dumps(requests)
         self.assertNotIn('Synthetic programming exercise - Google Chrome', wire_text)
         self.assertNotIn('Sign in - Google Chrome', wire_text)
@@ -451,9 +543,12 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(os.environ.get('FOCUSWITHAI_TEST_GOOGLE') == '1', 'opt-in Google API test')
     async def test_real_gemini_sprint_and_native_audio(self):
-        from config_store import load_config
-        config = load_config()
-        self.assertTrue(config.get('google_assistant_api_key'), 'A saved Gemini API key is required.')
+        from config_store import GEMINI_KEY, read_secret
+        path = Path('config.json')
+        config = json.loads(path.read_text(encoding='utf-8-sig'))
+        if sys.platform == 'win32':
+            config[GEMINI_KEY] = read_secret(path, GEMINI_KEY) or config.get(GEMINI_KEY)
+        self.assertTrue(config.get(GEMINI_KEY), 'A saved Gemini API key is required.')
         self.assertTrue(config.get('activity_allow_remote'), 'Text-context permission is required.')
         import io
         from PIL import Image, ImageDraw

@@ -203,7 +203,7 @@ class FocusHUD:
 
     def update(self, state, warning):
         win32gui.PumpWaitingMessages()
-        recording = state['sources']['armed']
+        recording = state['sources']['capture_active']
         if not (self.visible or warning or recording):
             self.card.hide()
             if self.prompt:

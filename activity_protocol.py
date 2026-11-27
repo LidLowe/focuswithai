@@ -29,6 +29,9 @@ class Recommendation(str, Enum):
 SYSTEM_PROMPT = (
     'Judge activity against sprint.goal and expected outcome. Indirectly related research, docs, tutorials, '
     'planning and tool setup can support the goal. Judge what the resource is being used for, not its category. '
+    'Use the active-window image as the primary evidence when available, supported by the text context. '
+    'Reuse a recent image only for the same observation while current_image_available is true. '
+    'When there is no usable image, assess permitted text context or return UNCERTAIN. '
     'Use recent activity and duration. Reserve confidence above 0.8 for strong evidence, for example a game '
     'explicitly named in the foreground during unrelated work. Use low confidence if purpose is unclear. '
     'Background applications or music/video alone are not a distraction. Reading, thinking, '

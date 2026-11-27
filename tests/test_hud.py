@@ -49,7 +49,7 @@ class HudTests(unittest.TestCase):
             hud = FocusHUD({'focus_hud_enabled': True}, Mock())
             try:
                 hud.update({
-                    'sources': {'armed': False}, 'sprint': None, 'meter_enabled': False,
+                    'sources': {'capture_active': False}, 'sprint': None, 'meter_enabled': False,
                     'activity': 'ON_TASK', 'score': 0, 'level': 'NORMAL', 'task': '',
                     'live_engine': {'connection_state': 'CONNECTED', 'last_success': None,
                                     'result': {'classification': 'INDIRECTLY_RELATED'}},

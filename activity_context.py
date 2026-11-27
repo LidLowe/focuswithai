@@ -16,13 +16,10 @@ CONTEXT_DEFAULTS = {
     'activity_excluded_windows': [],
     'browser_context_domains': [],
     'media_context_enabled': False,
-    'capture_enabled': False,
-    'capture_apps': [],
-    'capture_mode': 'event',
-    'capture_interval': 8,
-    'capture_width': 768,
-    'capture_height': 480,
-    'capture_quality': 72,
+    'capture_interval': 2,
+    'capture_width': 1280,
+    'capture_height': 720,
+    'capture_quality': 80,
     'live_analysis_seconds': 8,
     'live_volume': .55,
     'live_proactive': False,
@@ -35,7 +32,6 @@ CONTEXT_DEFAULTS = {
 
 BROWSERS = frozenset(('chrome.exe', 'msedge.exe', 'firefox.exe', 'brave.exe', 'opera.exe',
                       'vivaldi.exe', 'chromium.exe', 'arc.exe', 'waterfox.exe', 'librewolf.exe'))
-CHROME = 'chrome.exe'
 PRIVATE_APPS = frozenset(('credentialuibroker.exe', 'logonui.exe', 'lockapp.exe', 'keepass.exe',
                           'keepassxc.exe', '1password.exe', 'bitwarden.exe', 'telegram.exe',
                           'discord.exe', 'signal.exe', 'whatsapp.exe', 'slack.exe', 'teams.exe',
@@ -93,7 +89,6 @@ class Privacy:
     def __init__(self, config):
         self.apps = set(items(config, 'activity_excluded_apps')) | PRIVATE_APPS
         self.windows = items(config, 'activity_excluded_windows')
-        self.capture_apps = set(items(config, 'capture_apps'))
         self.domains = set(items(config, 'browser_context_domains'))
 
     def excluded(self, window):
@@ -106,9 +101,7 @@ class Privacy:
         executable = window.executable.casefold()
         name = ntpath.basename(executable)
         return (window.handle and bool(ntpath.splitdrive(executable)[0]) and ntpath.isabs(executable)
-                and name.endswith('.exe') and executable in self.capture_apps
-                and (name not in BROWSERS or name == CHROME)
-                and not self.excluded(window))
+                and name.endswith('.exe') and not self.excluded(window))
 
     @staticmethod
     def sensitive_page(text):
@@ -162,7 +155,7 @@ class ContextAggregator:
         self.decisions = deque(maxlen=5)
         self.window = Foreground()
         self.entered = 0.0
-        self.frame = self.sent_frame = self.frame_checked_at = None
+        self.frame = self.frame_checked_at = None
         self.browser = None
         self.media = None
         self.user_apps = []
@@ -174,7 +167,7 @@ class ContextAggregator:
                     and (old_app.casefold() not in BROWSERS or self.browser)):
                 self.switches.append((now, clean(old_app, 70), round(now - self.entered)))
             self.entered, self.window = now, window
-            self.frame = self.sent_frame = self.frame_checked_at = None
+            self.frame = self.frame_checked_at = None
             self.browser = None
 
     def decision(self, now, result):
@@ -206,5 +199,4 @@ class ContextAggregator:
                                        for at, label, confidence in self.decisions if now - at < 120],
             'distraction_score': int(score),
         }
-        frame = self.current_frame(now)
-        return facts, frame if frame and frame.differs(self.sent_frame) else None
+        return facts, self.current_frame(now)

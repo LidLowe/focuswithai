@@ -9,7 +9,7 @@ from pathlib import Path
 
 GEMINI_KEY = 'google_assistant_api_key'
 SECRET_KEYS = (GEMINI_KEY,)
-VERSION = 2
+VERSION = 3
 DEFAULT_PORT = 8765
 
 
@@ -77,13 +77,17 @@ def write_disk(path, data):
 
 def migrate(path, original):
     """Preserve the pre-consolidation settings without copying credentials to disk."""
-    backup = path.with_name(path.stem + '.pre-gemini-live.json')
+    is_legacy_provider = original.get('schema_version', 0) < 2
+    suffix = 'pre-gemini-live' if is_legacy_provider else 'pre-auto-capture'
+    backup = path.with_name(f'{path.stem}.{suffix}.json')
     if not backup.exists():
         write_disk(backup, public_config(original))
 
     known = defaults()
     data = {key: value for key, value in original.items() if key in known}
     data['schema_version'] = VERSION
+    if not is_legacy_provider:
+        return data
     if original.get('activity_provider_mode') != 'gemini_live':
         data['activity_allow_remote'] = False
         data['activity_send_remote_images'] = False

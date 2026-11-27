@@ -5,6 +5,7 @@ __pycache__
 run.bat
 config.json
 config.pre-gemini-live.json
+config.pre-auto-capture.json
 sessions.jsonl
 session_stats.json
 sprints.json

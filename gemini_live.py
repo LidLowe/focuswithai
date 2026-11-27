@@ -12,7 +12,7 @@ import aiohttp
 from activity_protocol import RESPONSE_SCHEMA, Result
 from activity_context import clean
 from commentary import KINDS
-from live_session import LiveProtocolError, LiveSetupError, LiveTransport, Output
+from live_session import LivePolicyClose, LiveProtocolError, LiveSetupError, LiveTransport, Output
 
 
 LOG = logging.getLogger(__name__)
@@ -77,8 +77,10 @@ class GeminiLiveTransport(LiveTransport):
         self.allow_commentary = config.get('live_proactive') is True
         self.allow_images = config.get('activity_send_remote_images') is True
         self.frame = None
+        self.current_image_available = False
         self.voice = config.get('gemini_live_voice', DEFAULTS['gemini_live_voice'])
         self.session = self.socket = None
+        self.setup_complete = False
         self.active = self.comment = None
         self.reported = self.stale = False
         self.ready = asyncio.Event()
@@ -115,6 +117,7 @@ class GeminiLiveTransport(LiveTransport):
         }})
         if 'setupComplete' not in await self._message():
             raise LiveProtocolError('Gemini не прислал setupComplete после handshake.')
+        self.setup_complete = True
         LOG.info('Gemini Live setupComplete received (model=%s)', self.model)
 
     async def wait_ready(self):
@@ -123,6 +126,7 @@ class GeminiLiveTransport(LiveTransport):
     async def send(self, event):
         if event.kind == 'SCREEN_FRAME':
             self.frame = event.data if self.allow_images else None
+            self.current_image_available = self.frame is not None
             return
         if event.kind != 'ACTIVITY_DURATION':
             self.changes[event.kind] = event.data
@@ -140,24 +144,25 @@ class GeminiLiveTransport(LiveTransport):
         self.requested = context.pop('COMMENTARY_REQUEST', None)
         prompt = json.dumps({
             'context_updates': context,
+            'current_image_available': self.current_image_available,
             'proactive_commentary_allowed': self.allow_commentary,
             'requested_commentary': self.requested,
         }, ensure_ascii=False)
         parts = [{'text': prompt}]
-        image_size = 0
-        if self.frame is not None:
-            image_size = len(self.frame.data)
+        frame, self.frame = self.frame, None
+        if frame is not None:
             parts.append({'inlineData': {'mimeType': 'image/jpeg',
-                                         'data': base64.b64encode(self.frame.data).decode('ascii')}})
-            self.frame = None
+                                         'data': base64.b64encode(frame.data).decode('ascii')}})
         await self.socket.send_json({'clientContent': {
             'turns': [{'role': 'user', 'parts': parts}], 'turnComplete': True,
         }})
         LOG.debug('Gemini Live context sent: %s', ', '.join(context))
-        if image_size:
-            LOG.debug('Gemini Live image sent: %d bytes', image_size)
+        if frame is not None:
+            LOG.debug('Gemini Live image sent: %d bytes', len(frame.data))
+        return frame
 
     async def interrupt(self):
+        self.current_image_available = False
         self.frame = None
         self.changes.clear()
         self.outputs.clear()
@@ -267,7 +272,7 @@ class GeminiLiveTransport(LiveTransport):
             code = code if isinstance(code, int) else None
             LOG.info('Gemini Live WebSocket closed: code=%s', code)
             if code == 1008:
-                raise LiveSetupError('Сервер отклонил параметры Gemini Live (WebSocket 1008). Проверь ключ, модель и проект.')
+                raise self._policy_close(message.extra)
             raise LiveProtocolError(f'WebSocket Gemini закрыт (код {code if code is not None else "не получен"}).')
         try:
             value = json.loads(message.data)
@@ -280,6 +285,25 @@ class GeminiLiveTransport(LiveTransport):
         if not isinstance(value, dict) or 'error' in value:
             raise LiveProtocolError('Gemini прислал ошибку или неизвестный формат сообщения.')
         return value
+
+    def _policy_close(self, detail):
+        # Close reasons are server text and can contain request details. Match known
+        # categories locally and expose only the fixed messages below.
+        reason = detail.casefold() if isinstance(detail, str) else ''
+        if not self.setup_complete:
+            return LiveSetupError('Gemini отклонил настройку до setupComplete (WebSocket 1008). Проверь доступ к модели и настройки проекта.')
+        if any(marker in reason for marker in ('inactivity', 'idle timeout', 'no input', 'no activity')):
+            return LivePolicyClose('Gemini закрыл соединение из-за бездействия (WebSocket 1008).',
+                                   expected_expiry=True)
+        if any(marker in reason for marker in ('session duration', 'session has expired', 'session time limit',
+                                               'maximum session length', 'connection duration')):
+            return LivePolicyClose('Истёк срок соединения Gemini Live (WebSocket 1008).', expected_expiry=True)
+        if any(marker in reason for marker in ('api key not valid', 'invalid api key', 'unauthenticated',
+                                               'permission denied', 'project is disabled')):
+            return LiveSetupError('Gemini сообщил об ошибке доступа к модели или проекту (WebSocket 1008).')
+        if any(marker in reason for marker in ('safety policy', 'usage policy', 'violates our policies')):
+            return LiveSetupError('Сервер остановил сессию по правилам использования (WebSocket 1008).')
+        return LivePolicyClose('Gemini закрыл уже установленную сессию (WebSocket 1008). Точная причина не подтверждена.')
 
     async def close(self):
         self.outputs.clear()
