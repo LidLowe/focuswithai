@@ -13,6 +13,7 @@ from collections import deque
 from typing import Any, Dict, List, Optional
 
 from aiohttp import web
+from activity_context import CAPTURE_LIMITS, validate_context_settings
 from audio_import import save_clip
 from config_store import DEFAULT_PORT, SECRET_KEYS, VERSION, defaults, load_config, public_config, save_config
 from gemini_live import MODELS, VOICES, GeminiLiveTransport, validate_preferences
@@ -192,6 +193,7 @@ def write_config(config: Dict[str, Any]):
     if type(config.get('schema_version', VERSION)) is not int or config.get('schema_version', VERSION) != VERSION:
         raise ValueError('Неподдерживаемая версия конфигурации.')
     validate_preferences(config)
+    validate_context_settings(config)
     if os.path.exists(CONFIG_FILE):
         backup_config()
     save_config(config)
@@ -373,6 +375,7 @@ class Panel:
         return {
             'config': mask_config(config),
             'defaults': defaults(),
+            'capture_limits': CAPTURE_LIMITS,
             'models': MODELS, 'voices': VOICES,
             'mtime': os.path.getmtime(CONFIG_FILE) if os.path.exists(CONFIG_FILE) else None,
             'live': self.rt is not None,

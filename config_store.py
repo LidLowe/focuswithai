@@ -128,11 +128,14 @@ def load_config(path='config.json'):
 
 
 def save_config(data, path='config.json'):
+    from activity_context import validate_context_settings
+
     path = Path(path)
     data = {**data, 'schema_version': VERSION}
     known = defaults()
     if data.keys() - known.keys():
         raise ValueError('Неизвестные настройки FocusWithAI.')
+    validate_context_settings(data)
     if sys.platform == 'win32':
         store_secret(path, GEMINI_KEY, data.get(GEMINI_KEY, ''))
         data = public_config(data)

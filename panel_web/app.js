@@ -43,7 +43,7 @@ const I = {
 // ---------- состояние ----------
 
 const S = {
-  cfg: null, defaults: {}, models: {}, voices: {}, mtime: null,
+  cfg: null, defaults: {}, captureLimits: {}, models: {}, voices: {}, mtime: null,
   draft: null, touched: new Set(),
   status: null, statusAt: 0, conn: true,
   route: 'current', loaded: {}, open: {},
@@ -100,6 +100,7 @@ const live = () => !!(S.status && S.status.live);
 
 function loadCfg(r) {
   S.cfg = r.config; S.defaults = r.defaults; S.models = r.models; S.voices = r.voices; S.mtime = r.mtime;
+  S.captureLimits = r.capture_limits || {};
   S.draft = clone(r.config); S.touched.clear();
 }
 
@@ -108,6 +109,8 @@ async function saveAll() {
   const set = {}, unset = [];
   for (const p of paths) {
     let v = getP(S.draft, p);
+    const error = v === undefined ? '' : captureValueError(p, v);
+    if (error) { toast(error, { bad: true }); return; }
     if (Array.isArray(v) && v.every((x) => typeof x === 'string')) v = v.map((x) => x.trim()).filter(Boolean);
     if (v === undefined) unset.push(p); else set[p] = v;
   }
@@ -192,7 +195,12 @@ function hydrate(root) {
     if (el.type === 'radio') el.checked = String(v ?? '') === el.value;
     else if (el.type === 'checkbox') el.checked = !!v;
     else if (t === 'num') {
-      el.value = v === undefined || v === null || v === '' ? '' : String(+(v / Number(el.dataset.scale || 1)).toFixed(4));
+      if (Object.hasOwn(S.captureLimits, k)) {
+        el.value = v ?? '';
+        markCaptureField(el, v);
+      } else {
+        el.value = v === undefined || v === null || v === '' ? '' : String(+(v / Number(el.dataset.scale || 1)).toFixed(4));
+      }
       if (el.dataset.out) fmtOut(el);
     } else if (t === 'json') el.value = v === undefined ? '' : JSON.stringify(v);
     else if (el.tagName === 'SELECT') {
@@ -201,12 +209,20 @@ function hydrate(root) {
     } else el.value = v ?? '';
   });
   $$('.lw', root).forEach(renderLW);
+  syncCapturePreset();
   updateDirty();
 }
 
 function onField(el) {
   const k = el.dataset.k, t = el.dataset.t;
   let v;
+  if (Object.hasOwn(S.captureLimits, k)) {
+    v = Number.isFinite(el.valueAsNumber) ? el.valueAsNumber : null;
+    markCaptureField(el, v);
+    setv(k, v);
+    syncCapturePreset();
+    return;
+  }
   if (el.type === 'radio') {
     if (!el.checked) return;
     v = t === 'int' ? parseInt(el.value, 10) : el.value;
@@ -595,7 +611,7 @@ function activityStatus(st) {
   </div>
   <div class="inl sprint-actions">
     ${src.capture_enabled ? '<button class="btn dark" type="button" data-ctl="focus_capture_stop">Остановить автозахват</button>'
-    : live && src.available && Object.hasOwn(src, 'capture_active') ?
+    : live && src.available && !src.settings_error && Object.hasOwn(src, 'capture_active') ?
       '<button class="btn dark" type="button" data-ctl="focus_capture_start">Включить автозахват</button>' : ''}
     ${live ? '<button class="btn" type="button" data-ctl="pause">Пауза мониторинга</button>' : ''}
   </div>
@@ -623,9 +639,23 @@ function captureDiagnostics(st) {
     invalid_dimensions: 'Недопустимый размер окна', blank_frame: 'Пустой кадр',
     unchanged: 'Кадр не изменился', capture_failed: 'Ошибка захвата'};
   const size = src.last_size;
+  const source = src.last_source_size;
+  const saved = (key) => eff(key, S.cfg);
+  const settings = src.settings;
+  const resolution = (w, h) => Number.isInteger(w) && Number.isInteger(h) ? `${w}×${h}` : '—';
+  const seconds = (value) => Number.isFinite(value) ? `${value} с` : '—';
   const capture = src.capture_active ? 'Активен' : src.capture_enabled ? 'На паузе' : 'Выключен';
-  const fields = [['Состояние захвата', capture], ['Получено кадров', src.frames_captured], ['Отправлено Gemini', engine?.frames ?? 0],
-    ['Размер последнего кадра', size ? `${size.width}×${size.height} · ${size.bytes} байт` : '—'],
+  const fields = [['Состояние захвата', capture],
+    ['Максимум · сохранено', resolution(saved('capture_width'), saved('capture_height'))],
+    ['Максимум · применяется', resolution(settings?.capture_width, settings?.capture_height)],
+    ['Размер окна последнего кадра', resolution(source?.[0], source?.[1])],
+    ['Размер последнего JPEG', size ? `${resolution(size.width, size.height)} · ${size.bytes} байт` : '—'],
+    ['Интервал · сохранено', seconds(saved('capture_interval'))],
+    ['Базовый интервал · применяется', seconds(settings?.capture_interval)],
+    ['Адаптивный интервал · сейчас', seconds(src.adaptive_interval)],
+    ['Качество JPEG · сохранено', saved('capture_quality') ?? '—'],
+    ['Качество JPEG · применяется', settings?.capture_quality ?? '—'],
+    ['Получено кадров', src.frames_captured], ['Отправлено Gemini', engine?.frames ?? 0],
     ['Последний захват', time(src.last_capture)], ['Последняя отправка', time(engine?.last_frame_sent)],
     ['Причина пропуска', skipped[src.capture_skip] ?? '—']];
   return `<div class="activity-grid">${fields.map(([label, value]) =>
@@ -640,8 +670,66 @@ function contextFlag(label, key) {
   return contextField(label, key, [[false, 'Выкл.'], [true, 'Вкл.']]);
 }
 
-function contextNumber(label, key, min, max, step = 1) {
-  return audioField(label, key, (id) => num(key, { id, min, max, step, int: step === 1 }));
+const CAPTURE_PRESETS = {
+  hd: ['HD', 1280, 720],
+  fullhd: ['Full HD', 1920, 1080],
+  qhd: ['QHD', 2560, 1440],
+  uhd: ['UHD', 3840, 2160],
+};
+const CAPTURE_LABELS = {
+  capture_interval: 'Интервал захвата, с',
+  capture_width: 'Максимальная ширина, px',
+  capture_height: 'Максимальная высота, px',
+  capture_quality: 'Качество JPEG',
+};
+
+function captureValueError(key, value) {
+  const limits = S.captureLimits[key];
+  if (!limits) return '';
+  const { min, max, integer } = limits;
+  if (Number.isFinite(value) && value >= min && value <= max && (!integer || Number.isInteger(value))) return '';
+  return `${CAPTURE_LABELS[key]} — требуется ${integer ? 'целое число' : 'число'} от ${min} до ${max}.`;
+}
+
+function markCaptureField(el, value) {
+  const error = captureValueError(el.dataset.k, value);
+  el.setCustomValidity(error);
+  el.setAttribute('aria-invalid', String(!!error));
+  el.classList.toggle('bad', !!error);
+}
+
+function syncCapturePreset() {
+  const select = $('[data-capture-preset]');
+  if (!select) return;
+  const choice = Object.entries(CAPTURE_PRESETS).find(([, [, width, height]]) =>
+    width === eff('capture_width') && height === eff('capture_height'));
+  select.value = choice?.[0] || 'custom';
+}
+
+function captureControls() {
+  if (!Object.keys(S.captureLimits).length) {
+    return '<div class="card-top note">Перезапусти FocusWithAI, чтобы загрузить правила проверки захвата.</div>';
+  }
+  const options = Object.entries(CAPTURE_PRESETS).map(([key, [label, width, height]]) =>
+    `<option value="${key}">${label} — ${width}×${height}</option>`).join('');
+  const id = nid();
+  const preset = `<select class="field" id="${id}" data-capture-preset>${options}<option value="custom">Custom</option></select>`;
+  return row('Пресет разрешения', 'Кадр сохраняет пропорции и размер не превышает исходный.', '', preset, id)
+    + Object.entries(CAPTURE_LABELS).map(([key, label]) => {
+      const { min, max, integer } = S.captureLimits[key];
+      return audioField(label, key, (id) => num(key, { id, min, max, int: integer }));
+    }).join('');
+}
+
+function contextSettingsStatus(st) {
+  const sources = st?.focus?.sources;
+  if (!sources) return '<p class="note">Сохранённые настройки применятся при запуске.</p>';
+  const restart = sources.settings_error || sources.settings && Object.entries(sources.settings)
+    .some(([key, value]) => !same(value, eff(key, S.cfg)));
+  if (!restart) return '';
+  return `${sources.settings_error ? `<p role="alert">${esc(sources.settings_error)}</p>` : ''}
+    <div class="inl"><span class="note">Чтобы применить сохранённые настройки, перезапусти FocusWithAI.</span>
+      <button class="btn" type="button" data-act="restart">Перезапустить</button></div>`;
 }
 
 PAGES.activity = {
@@ -655,17 +743,14 @@ PAGES.activity = {
         <img class="context-image" data-context-image alt="Последний кадр активного окна" hidden>
       </section>
       <section class="card">
-        <div class="card-top"><h2>Источники контекста</h2></div>
-        ${contextNumber('Интервал захвата, с', 'capture_interval', 2, 120)}
-        ${contextNumber('Максимальная ширина, px', 'capture_width', 160, 1600)}
-        ${contextNumber('Максимальная высота, px', 'capture_height', 160, 1600)}
-        ${contextNumber('Качество JPEG', 'capture_quality', 35, 95)}
+        <div class="card-top"><h2>Источники контекста</h2><div data-context-settings-status>${contextSettingsStatus(S.status)}</div></div>
+        ${captureControls()}
         ${contextFlag('Передавать изображения в Gemini', 'activity_send_remote_images')}
         ${row('Исключённые приложения', 'Имя EXE или полный путь', 'activity_excluded_apps',
           lw('activity_excluded_apps', 'rows', { name: 'Приложение', add: 'Исключить приложение' }))}
         ${row('Исключённые окна', 'Любой фрагмент заголовка', 'activity_excluded_windows',
           lw('activity_excluded_windows', 'rows', { name: 'Заголовок', add: 'Исключить окно' }))}
-        ${row('Рабочие домены браузера', 'Если список заполнен, кадры Chrome разрешены только для этих доменов. Расширение отдельно добавляет метаданные вкладки.', 'browser_context_domains',
+        ${row('Рабочие домены браузера', 'Укажи домен или IP без схемы, порта и пути. Заполненный список ограничивает кадры Chrome, расширение отдельно добавляет метаданные вкладки.', 'browser_context_domains',
           lw('browser_context_domains', 'rows', { name: 'Домен', add: 'Добавить домен' }))}
         ${contextFlag('Метаданные медиасеанса Windows', 'media_context_enabled')}
       </section>`;
@@ -1147,6 +1232,20 @@ document.addEventListener('change', async (e) => {
     return;
   }
   const el = e.target;
+  if (el.matches('[data-capture-preset]')) {
+    const preset = CAPTURE_PRESETS[el.value];
+    if (preset) {
+      const [, width, height] = preset;
+      setv('capture_width', width);
+      setv('capture_height', height);
+      for (const [key, value] of [['capture_width', width], ['capture_height', height]]) {
+        const field = $(`[data-k="${key}"]`);
+        field.value = value;
+        markCaptureField(field, value);
+      }
+    }
+    return;
+  }
   if (el.dataset.audioEvent) { S.audioEvents[el.dataset.audioEvent] = el.value; delete S.audioFiles[el.dataset.audioEvent]; render(); return; }
   if (el.dataset.audioFile) { S.audioFiles[el.dataset.audioFile] = el.value; return; }
   if (el.dataset.notificationEvent) {
@@ -1238,6 +1337,8 @@ async function poll() {
     if (section) setHtml(section, activityStatus(S.status));
     const capture = $('[data-capture-diagnostics]');
     if (capture) setHtml(capture, captureDiagnostics(S.status));
+    const settings = $('[data-context-settings-status]');
+    if (settings) setHtml(settings, contextSettingsStatus(S.status));
   } else if (S.route === 'diagnostics' && S.cfg) {
     const section = $('[data-diagnostics-live]');
     if (section) setHtml(section, liveStatus(S.status));

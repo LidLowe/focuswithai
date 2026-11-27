@@ -30,6 +30,15 @@ CONTEXT_DEFAULTS = {
     'activity_confirmation_seconds': 5,
 }
 
+CAPTURE_LIMITS = {
+    'capture_interval': {'min': 1, 'max': 120, 'integer': False},
+    'capture_width': {'min': 160, 'max': 7680, 'integer': True},
+    'capture_height': {'min': 160, 'max': 7680, 'integer': True},
+    'capture_quality': {'min': 35, 'max': 95, 'integer': True},
+}
+CONTEXT_FLAGS = ('activity_send_remote_images', 'media_context_enabled')
+CONTEXT_LISTS = ('activity_excluded_apps', 'activity_excluded_windows', 'browser_context_domains')
+
 BROWSERS = frozenset(('chrome.exe', 'msedge.exe', 'firefox.exe', 'brave.exe', 'opera.exe',
                       'vivaldi.exe', 'chromium.exe', 'arc.exe', 'waterfox.exe', 'librewolf.exe'))
 PRIVATE_APPS = frozenset(('credentialuibroker.exe', 'logonui.exe', 'lockapp.exe', 'keepass.exe',
@@ -60,6 +69,36 @@ def items(config, key):
     return tuple(x.strip().casefold() for x in values if isinstance(x, str) and x.strip()) if isinstance(values, list) else ()
 
 
+def context_source_settings(config):
+    return {key: config.get(key, CONTEXT_DEFAULTS[key])
+            for key in (*CAPTURE_LIMITS, *CONTEXT_FLAGS, *CONTEXT_LISTS)}
+
+
+def validate_context_settings(config):
+    values = context_source_settings(config)
+    for key, limits in CAPTURE_LIMITS.items():
+        value = values[key]
+        low, high = limits['min'], limits['max']
+        if (type(value) not in (int, float) or not low <= value <= high
+                or (limits['integer'] and value != int(value))):
+            number = 'целое число' if limits['integer'] else 'число'
+            raise ValueError(f'{key} — требуется {number} от {low} до {high}.')
+    for key in CONTEXT_FLAGS:
+        if type(values[key]) is not bool:
+            raise ValueError(f'{key} — требуется true или false.')
+    for key in CONTEXT_LISTS:
+        if not isinstance(values[key], list) or any(not isinstance(item, str) or not item.strip() for item in values[key]):
+            raise ValueError(f'{key} — требуется список непустых строк.')
+    for item in values['browser_context_domains']:
+        host = item.strip().casefold()
+        if host != 'localhost' and not DOMAIN.fullmatch(host):
+            try:
+                ipaddress.ip_address(host)
+            except ValueError:
+                raise ValueError('browser_context_domains — укажи домен или IP без схемы, порта и пути.') from None
+    return values
+
+
 def setting(config, key, low, high):
     try:
         value = float(config.get(key, CONTEXT_DEFAULTS[key]))
@@ -78,6 +117,7 @@ class Frame:
     height: int
     captured_at: float
     source_key: tuple | None = None
+    source_size: tuple[int, int] | None = None
 
     def differs(self, other):
         if other is None or self.source_key != other.source_key:

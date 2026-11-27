@@ -174,6 +174,7 @@ def capture_window(window, dimensions, quality):
     if _affinity(window.handle, ctypes.byref(affinity)) and affinity.value:
         return None, 'protected_window'
 
+    source_size = image.size
     image.thumbnail(dimensions)
     if image.width < 40 or image.height < 40:
         return None, 'invalid_dimensions'
@@ -183,7 +184,8 @@ def capture_window(window, dimensions, quality):
         return None, 'blank_frame'
     output = io.BytesIO()
     image.convert('RGB').save(output, 'JPEG', quality=quality)
-    return Frame(output.getvalue(), gray.tobytes(), image.width, image.height, time.monotonic()), None
+    return Frame(output.getvalue(), gray.tobytes(), image.width, image.height, time.monotonic(),
+                 source_size=source_size), None
 
 
 def capture_browser_window(window, dimensions, quality, browser_check):

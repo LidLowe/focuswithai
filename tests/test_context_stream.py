@@ -1,11 +1,18 @@
+import io
 import sys
+import tempfile
 import time
 import unittest
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from aiohttp.test_utils import TestClient, TestServer
+
 from acquisition import Acquisition
+from config_store import load_config, save_config
+from panel import Panel
 from focus_meter import Foreground
 
 from activity_context import Frame
@@ -82,7 +89,58 @@ class AcquisitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(source.context.current_frame(now + .1), first)
         self.assertEqual(source.next_capture, now + .1 + 4)
         self.assertEqual(source.capture_skip, 'unchanged')
+        self.assertEqual(source.status()['adaptive_interval'], 4)
         source.suspend()
+
+
+class ContextSettingsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_save_rejects_invalid_context_settings_and_new_runtime_reads_valid_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.json'
+            with (patch('config_store.read_secret', return_value=''), patch('config_store.store_secret'),
+                  patch('panel.CONFIG_FILE', str(path)), patch('panel.BACKUP_DIR', str(path.parent / 'backups')),
+                  patch('panel.load_config', side_effect=lambda: load_config(path)),
+                  patch('panel.save_config', side_effect=lambda values: save_config(values, path))):
+                defaults = Acquisition(load_config(path))
+                headers = {'X-Panel': '1'}
+                async with TestClient(TestServer(Panel(None).app)) as client:
+                    response = await client.get('/api/config')
+                    schema = (await response.json())['capture_limits']
+                    self.assertEqual(schema['capture_width']['max'], 7680)
+                    self.assertEqual(schema['capture_height']['max'], 7680)
+                    settings = {'capture_width': 1920, 'capture_height': 1080, 'capture_interval': 1.25,
+                                'capture_quality': 90, 'media_context_enabled': True,
+                                'activity_send_remote_images': True, 'activity_excluded_apps': ['notepad.exe'],
+                                'activity_excluded_windows': ['Example title'], 'browser_context_domains': ['example.org']}
+                    response = await client.put('/api/config', json={'set': settings}, headers=headers)
+                    self.assertEqual(response.status, 200, await response.text())
+                    saved = path.read_bytes()
+                    self.assertEqual(defaults.status()['settings']['capture_width'], 1280)
+                    restarted = Acquisition(load_config(path))
+                    self.assertEqual(restarted.status()['settings'], settings)
+                    self.assertEqual((restarted.dimensions, restarted.interval, restarted.quality), ((1920, 1080), 1.25, 90))
+                    invalid = {'capture_width': 7681, 'capture_height': 719.5, 'capture_interval': 0,
+                               'capture_quality': True, 'media_context_enabled': 'false',
+                               'activity_send_remote_images': 1, 'activity_excluded_apps': 'notepad.exe',
+                               'activity_excluded_windows': [None], 'browser_context_domains': ['https://example.org/path']}
+                    for key, value in invalid.items():
+                        with self.subTest(key=key):
+                            response = await client.put('/api/config', json={'set': {key: value}}, headers=headers)
+                            self.assertEqual(response.status, 400, await response.text())
+                            self.assertIn(key, (await response.json())['error'])
+                            self.assertEqual(path.read_bytes(), saved)
+                    response = await client.put('/api/config',
+                                                json={'set': {'capture_width': 7680, 'capture_height': 7680}},
+                                                headers=headers)
+                    self.assertEqual(response.status, 200, await response.text())
+                    self.assertEqual(Acquisition(load_config(path)).dimensions, (7680, 7680))
+
+    def test_invalid_on_disk_configuration_disables_capture_with_a_reason(self):
+        source = Acquisition({'capture_width': 9000})
+        self.assertIsNone(source.status()['settings'])
+        self.assertIn('capture_width', source.status()['settings_error'])
+        with self.assertRaisesRegex(ValueError, 'capture_width'):
+            source.start_capture('sprint')
 
 
 class ChromeCaptureTests(unittest.TestCase):
@@ -224,6 +282,35 @@ class ChromeCaptureTests(unittest.TestCase):
             grab.reset_mock()
             affinity.side_effect = set_affinity
             self.assertEqual(capture_window(notepad, (80, 80), 72), (None, 'protected_window'))
+            grab.assert_not_called()
+
+
+    @unittest.skipUnless(sys.platform == 'win32', 'uses the Windows capture adapter')
+    def test_capture_respects_maximum_size_without_upscaling_the_rendered_window(self):
+        from PIL import Image
+        from windows_acquisition import capture_window
+
+        notepad = Foreground(5, 6, 'Notes - Notepad', r'C:\Windows\notepad.exe')
+        image = Image.new('RGB', (1920, 1080), 'white')
+        image.paste((0, 0, 0), (0, 0, 640, 400))
+        cases = [((1280, 720), (1280, 720)), ((1920, 1080), (1920, 1080)),
+                 ((2560, 1440), (1920, 1080)), ((1920, 1200), (1920, 1080))]
+        with (patch('windows_acquisition.foreground', return_value=notepad),
+              patch('windows_acquisition.win32gui.IsIconic', return_value=False),
+              patch('windows_acquisition.win32gui.GetWindowRect', return_value=(0, 0, 1920, 1080)),
+              patch('windows_acquisition._affinity', return_value=False),
+              patch('windows_acquisition.window_image', side_effect=lambda *_: image.copy()) as grab):
+            for maximum, expected in cases:
+                with self.subTest(maximum=maximum):
+                    config = {'capture_width': maximum[0], 'capture_height': maximum[1]}
+                    frame, reason = capture_window(notepad, Acquisition(config).dimensions, 80)
+                    self.assertIsNone(reason)
+                    self.assertEqual(frame.source_size, (1920, 1080))
+                    with Image.open(io.BytesIO(frame.data)) as jpeg:
+                        self.assertEqual(jpeg.size, expected)
+            grab.reset_mock()
+            with patch('windows_acquisition.win32gui.GetWindowRect', return_value=(0, 0, 7680, 4320)):
+                self.assertEqual(capture_window(notepad, (7680, 7680), 80), (None, 'invalid_dimensions'))
             grab.assert_not_called()
 
 

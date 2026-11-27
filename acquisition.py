@@ -6,7 +6,8 @@ import ntpath
 import threading
 import time
 
-from activity_context import BROWSERS, ContextAggregator, Privacy, clean, items, setting
+from activity_context import (BROWSERS, CAPTURE_LIMITS, ContextAggregator, Privacy, clean,
+                              items, validate_context_settings)
 
 
 def background(function, *args):
@@ -38,10 +39,17 @@ class Acquisition:
         self.privacy = Privacy(config)
         self.context = ContextAggregator(self.privacy)
         self.has_capture = bool(windows and importlib.util.find_spec('PIL'))
-        self.interval = setting(config, 'capture_interval', 2, 120)
-        self.dimensions = tuple(int(setting(config, key, 160, 1600)) for key in ('capture_width', 'capture_height'))
-        self.quality = int(setting(config, 'capture_quality', 35, 95))
-        self.media = windows.MediaMonitor() if windows and config.get('media_context_enabled') else None
+        self.settings = None
+        self.settings_error = None
+        self.interval = self.dimensions = self.quality = None
+        try:
+            settings = self.settings = validate_context_settings(config)
+            self.interval = settings['capture_interval']
+            self.dimensions = int(settings['capture_width']), int(settings['capture_height'])
+            self.quality = int(settings['capture_quality'])
+        except ValueError as error:
+            self.settings_error = str(error)
+        self.media = windows.MediaMonitor() if windows and config.get('media_context_enabled') is True else None
         self.capture_job = self.media_job = self.apps_job = None
         self.next_capture = self.next_media = self.next_apps = 0
         self.capture_epoch = 0
@@ -49,14 +57,22 @@ class Acquisition:
         self.capture_skip = 'disabled'
         self.frames_captured = 0
         self.last_capture = None
-        self.last_size = None
+        self.last_size = self.last_source_size = None
         self.media_error = None
         self.apps = []
         self.allowed_apps = set(items(config, 'context_allowed_apps'))
         self.capture_backoff = 1
         self.active = False
 
+    @property
+    def adaptive_interval(self):
+        if self.interval is not None:
+            return min(CAPTURE_LIMITS['capture_interval']['max'], self.interval * self.capture_backoff)
+        return None
+
     def start_capture(self, sprint_id):
+        if self.settings_error:
+            raise ValueError(self.settings_error)
         if not self.has_capture:
             raise ValueError('Автозахват требует Windows и Pillow.')
         if self.capture_sprint == sprint_id:
@@ -155,6 +171,7 @@ class Acquisition:
                     self.frames_captured += 1
                     self.last_capture = time.time()
                     self.last_size = {'width': frame.width, 'height': frame.height, 'bytes': len(frame.data)}
+                    self.last_source_size = frame.source_size
                     if frame.differs(self.context.frame):
                         self.context.frame = frame
                         self.capture_backoff = 1
@@ -162,7 +179,7 @@ class Acquisition:
                     else:
                         self.capture_skip = 'unchanged'
                         self.capture_backoff = min(4, self.capture_backoff * 2)
-                        self.next_capture = now + min(120, self.interval * self.capture_backoff)
+                        self.next_capture = now + self.adaptive_interval
                 else:
                     self.context.frame = None
                     self.capture_backoff = 1
@@ -177,7 +194,7 @@ class Acquisition:
         if self.capture_job or now < self.next_capture:
             return
         self.job_epoch = self.capture_epoch
-        self.next_capture = now + min(120, self.interval * self.capture_backoff)
+        self.next_capture = now + self.adaptive_interval
         if ntpath.basename(window.executable).casefold() in BROWSERS:
             self.capture_job = background(self.windows.capture_browser_window, window, self.dimensions,
                                           self.quality, self.privacy.browser_capture_reason)
@@ -197,6 +214,9 @@ class Acquisition:
         return {'available': self.has_capture, 'capture_active': bool(self.active and self.capture_sprint),
                 'capture_enabled': bool(self.capture_sprint), 'frames_captured': self.frames_captured,
                 'last_capture': self.last_capture, 'last_size': self.last_size,
+                'last_source_size': self.last_source_size, 'settings': self.settings,
+                'settings_error': self.settings_error,
+                'adaptive_interval': self.adaptive_interval if self.active and self.capture_sprint else None,
                 'preview_frame_id': frame.captured_at if frame else None,
                 'capture_skip': self.capture_skip, 'media_error': self.media_error,
                 'apps': self.apps, 'browser': tab,
