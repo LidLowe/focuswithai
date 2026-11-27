@@ -38,6 +38,8 @@ class DecisionEngine:
             factor = result.confidence * (1 - result.relevance) * min(1, .6 + duration / 40)
             return ActivityState.OFF_TASK, factor, self.confirmations >= 2 and duration >= self.confirmation
         self.first_off, self.confirmations, self.last = None, 0, None
-        if result.classification in (Classification.ON_TASK, Classification.INDIRECTLY_RELATED):
+        if result.classification == Classification.ON_TASK:
             return ActivityState.ON_TASK, result.confidence, False
+        if result.classification == Classification.INDIRECTLY_RELATED:
+            return ActivityState.INDIRECTLY_RELATED, result.confidence * .5, False
         return ActivityState.UNCERTAIN, 0, False

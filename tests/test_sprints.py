@@ -5,10 +5,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from activity_context import ContextAggregator, Privacy
+from activity_context import ContextAggregator, Privacy, sprint_context
 from context_stream import ContextStream
 from focus_meter import ActivityState, Foreground
-from sprints import SprintManager
+from sprints import SPRINT_TEXT_LIMITS, SprintManager
 
 
 class SprintTests(unittest.TestCase):
@@ -112,6 +112,22 @@ class SprintTests(unittest.TestCase):
         self.assertEqual(self.store.summary()['state'], 'ACTIVE')
         self.assertEqual(len(self.store.snapshot()['sprints']), 1)
 
+
+    def test_descriptive_fields_and_all_subtasks_reach_context_without_truncation(self):
+        fields = {key: ('  Study circuit models.\n' + 'Ж' * limit)[:limit - len(key)] + key
+                  for key, limit in SPRINT_TEXT_LIMITS.items() if key != 'title'}
+        tasks = [f'{index:02d} ' + 'x' * 197 for index in range(30)]
+        sprint = self.start(**fields, subtasks=tasks)
+        self.open_store()
+        self.command(sprint, 'resume')
+        context = sprint_context(self.store.llm_context)
+        for key, value in fields.items():
+            self.assertEqual(context[key], value)
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
+                self.command(sprint, 'edit', **{key: value + 'x'})
+        self.assertEqual([task['text'] for task in context['subtasks']], tasks)
+        self.assertEqual(sprint_context(json.dumps({'goal': 'Read docs\npassword=fixture'}))['goal'],
+                         'Read docs\n[redacted]')
 
     def test_live_sprint_goal_replaces_old_goal(self):
         item = self.start(goal='Learn VLANs', description='Network lab')

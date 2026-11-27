@@ -43,7 +43,7 @@ const I = {
 // ---------- состояние ----------
 
 const S = {
-  cfg: null, defaults: {}, captureLimits: {}, models: {}, voices: {}, mtime: null,
+  cfg: null, defaults: {}, captureLimits: {}, sprintTextLimits: {}, promptLimits: {}, models: {}, voices: {}, mtime: null,
   draft: null, touched: new Set(),
   status: null, statusAt: 0, conn: true,
   route: 'current', loaded: {}, open: {},
@@ -101,6 +101,8 @@ const live = () => !!(S.status && S.status.live);
 function loadCfg(r) {
   S.cfg = r.config; S.defaults = r.defaults; S.models = r.models; S.voices = r.voices; S.mtime = r.mtime;
   S.captureLimits = r.capture_limits || {};
+  S.sprintTextLimits = r.sprint_text_limits || {};
+  S.promptLimits = r.prompt_limits || {};
   S.draft = clone(r.config); S.touched.clear();
 }
 
@@ -111,6 +113,11 @@ async function saveAll() {
     let v = getP(S.draft, p);
     const error = v === undefined ? '' : captureValueError(p, v);
     if (error) { toast(error, { bad: true }); return; }
+    const limit = S.promptLimits[p];
+    if (limit && v !== undefined && (typeof v !== 'string' || [...v].length > limit)) {
+      toast(`${PROMPT_LABELS[p]} — до ${limit} символов.`, { bad: true });
+      return;
+    }
     if (Array.isArray(v) && v.every((x) => typeof x === 'string')) v = v.map((x) => x.trim()).filter(Boolean);
     if (v === undefined) unset.push(p); else set[p] = v;
   }
@@ -340,7 +347,7 @@ function render() {
 
 const PAGES = {};
 
-const FOCUS_STATES = { ON_TASK: 'В работе', UNCERTAIN: 'Уточняю активность', OFF_TASK: 'Отвлечение',
+const FOCUS_STATES = { ON_TASK: 'В работе', INDIRECTLY_RELATED: 'Связано с целью', UNCERTAIN: 'Уточняю активность', OFF_TASK: 'Отвлечение',
   IDLE: 'Бездействие', BREAK: 'Перерыв', PAUSED: 'На паузе', NO_SPRINT: 'Нет активного спринта' };
 const FOCUS_LEVELS = { NEUTRAL: 'Нет подтверждения', NORMAL: 'Норма', ATTENTION: 'Внимание', WARNING: 'Предупреждение', CRITICAL: 'Критический' };
 
@@ -375,6 +382,18 @@ function sprintLive(st, controls = false) {
     </div>` : ''}`;
 }
 
+const SPRINT_TEXT_LABELS = {
+  goal: 'Цель', title: 'Название', description: 'Описание задачи',
+  expected_outcome: 'Ожидаемый результат', context: 'Дополнительный контекст для модели',
+};
+const PROMPT_LABELS = {activity_classification_prompt: 'Промпт классификации', gemini_live_prompt: 'Манера речи'};
+const textLimit = (limit) => limit ? `До ${limit} символов.` : '';
+
+function sprintText(key) {
+  const limit = textLimit(S.sprintTextLimits[key]);
+  return `${SPRINT_TEXT_LABELS[key]}${limit ? ` <span class="note">${limit}</span>` : ''}`;
+}
+
 function sprintForm() {
   const edit = S.sprintEdit;
   const draft = S.sprintForm || edit || {};
@@ -384,17 +403,22 @@ function sprintForm() {
   const canStartDraft = edit?.state === 'NOT_STARTED';
   return `<form class="card pad sprint-form" data-sprint-form>
     <h2>${edit ? 'Редактирование спринта' : 'Новый спринт'}</h2>
-    <label>Цель <input class="field" name="goal" placeholder="Например, разобраться с VLAN и настроить стенд"
-      value="${esc(draft.goal)}" required maxlength="500"></label>
+    <label>${sprintText('goal')} <textarea class="field" name="goal" rows="2" required
+      placeholder="Например, разобраться с VLAN и настроить стенд">
+${esc(draft.goal)}</textarea></label>
     <details${edit || draft.duration_minutes ? ' open' : ''}><summary>Параметры спринта</summary>
       <div class="sprint-fields">
-        <label>Название <input class="field" name="title" maxlength="160" value="${esc(draft.title)}"></label>
+        <label>${sprintText('title')} <input class="field" name="title" value="${esc(draft.title)}"></label>
         <label>Длительность, мин <input class="field" type="number" name="duration_minutes" min="1" max="1440"
           placeholder="Без ограничения" value="${esc(draft.duration_minutes)}"${timed ? '' : ' disabled'}></label>
-        <label>Описание задачи <textarea class="field" name="description" rows="2" maxlength="2000">${esc(draft.description)}</textarea></label>
-        <label>Ожидаемый результат <textarea class="field" name="expected_outcome" rows="2" maxlength="1000">${esc(draft.expected_outcome)}</textarea></label>
-        <label>Подзадачи, по одной на строку <textarea class="field" name="subtasks" rows="3">${esc(subtasks)}</textarea></label>
-        <label>Дополнительный контекст для модели <textarea class="field" name="context" rows="3" maxlength="2000">${esc(draft.context)}</textarea></label>
+        <label>${sprintText('description')} <textarea class="field" name="description" rows="2">
+${esc(draft.description)}</textarea></label>
+        <label>${sprintText('expected_outcome')} <textarea class="field" name="expected_outcome" rows="2">
+${esc(draft.expected_outcome)}</textarea></label>
+        <label>Подзадачи, по одной на строку <span class="note">До 30 подзадач по 200 символов.</span>
+          <textarea class="field" name="subtasks" rows="3">${esc(subtasks)}</textarea></label>
+        <label>${sprintText('context')} <textarea class="field" name="context" rows="3">
+${esc(draft.context)}</textarea></label>
       </div>
     </details>
     <div class="inl">
@@ -418,7 +442,7 @@ function sprintReport(sprint) {
     ${date ? `<p class="note">Начало · ${esc(date)}</p>` : ''}
     <dl>${summary.map(([label, seconds]) => `<div><dt>${label}</dt><dd>${fmtMS(seconds)}</dd></div>`).join('')}
       <div><dt>Вмешательства</dt><dd>${report.interventions}</dd></div></dl>
-    <p class="note">Неоднозначная активность и бездействие входят в общее время работы.</p>
+    <p class="note">Вспомогательные действия, неоднозначная активность и бездействие входят в общее время.</p>
     ${sprint.expected_outcome ? `<p>Ожидалось · ${esc(sprint.expected_outcome)}</p>` : ''}
     <div class="sprint-fields">
       <div><b>Основные приложения</b>${apps ? `<ul>${apps}</ul>` : '<div class="note">Нет данных</div>'}</div>
@@ -670,6 +694,10 @@ function contextFlag(label, key) {
   return contextField(label, key, [[false, 'Выкл.'], [true, 'Вкл.']]);
 }
 
+function contextNumber(label, key, min, max, step = 1) {
+  return audioField(label, key, (id) => num(key, { id, min, max, step, int: step === 1 }));
+}
+
 const CAPTURE_PRESETS = {
   hd: ['HD', 1280, 720],
   fullhd: ['Full HD', 1920, 1080],
@@ -824,7 +852,13 @@ PAGES.live = {
         ${contextNumber('Интервал анализа, с', 'live_analysis_seconds', 2, 120)}
         ${contextNumber('Громкость Live Audio', 'live_volume', 0, 1, .05)}
         ${contextFlag('Инициативные комментарии', 'live_proactive')}
-        ${row('Системный промпт для манеры речи', '', 'gemini_live_prompt', area('gemini_live_prompt', 4))}
+        ${row(PROMPT_LABELS.activity_classification_prompt,
+          'Уточняет критерии связи с целью, признаки активности и примеры. Правила безопасности и формат ответа задаёт приложение. '
+            + textLimit(S.promptLimits.activity_classification_prompt),
+          'activity_classification_prompt', area('activity_classification_prompt', 6, {label: PROMPT_LABELS.activity_classification_prompt}))}
+        ${row(PROMPT_LABELS.gemini_live_prompt,
+          'Задаёт тон и формулировки голосовых комментариев. ' + textLimit(S.promptLimits.gemini_live_prompt),
+          'gemini_live_prompt', area('gemini_live_prompt', 4, {label: PROMPT_LABELS.gemini_live_prompt}))}
         ${row('Приложения в контексте модели', 'Имена разрешённых EXE, например Code.exe.', 'context_allowed_apps',
           lw('context_allowed_apps', 'rows', {name:'Имя EXE', add:'Добавить'}))}
       </section>
@@ -1180,6 +1214,16 @@ document.addEventListener('submit', async (event) => {
       toast('Результат подтверждён');
     });
     return;
+  }
+  for (const [key, limit] of Object.entries(S.sprintTextLimits)) {
+    if ([...(values[key] || '')].length > limit) {
+      toast(`${SPRINT_TEXT_LABELS[key]} — до ${limit} символов.`, { bad: true });
+      const field = form.elements[key];
+      const details = field?.closest('details');
+      if (details) details.open = true;
+      field?.focus();
+      return;
+    }
   }
   const action = event.submitter?.value || (S.sprintEdit ? 'edit' : 'quick_start');
   const id = S.sprintEdit?.id;

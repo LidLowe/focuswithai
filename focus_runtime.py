@@ -86,7 +86,9 @@ class FocusController:
         hotkey = bool(self.hud and self.hud.hotkey)
         private = self.acquisition.privacy.excluded(self.sample[0])
         browser = ntpath.basename(self.sample[0].executable).casefold() in BROWSERS
-        neutral = not phase.active or self.state not in (ActivityState.OFF_TASK, ActivityState.ON_TASK)
+        neutral = not phase.active or self.state not in (
+            ActivityState.OFF_TASK, ActivityState.ON_TASK, ActivityState.INDIRECTLY_RELATED,
+        )
         return {
             'score': int(self.meter.score), 'level': self.meter.level.name if not neutral else 'NEUTRAL',
             'activity': self.state.value if phase.active else 'PAUSED' if phase.paused else 'BREAK' if phase.sprint else 'NO_SPRINT',

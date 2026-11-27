@@ -11,6 +11,7 @@ from voicepack import Event
 
 class ActivityState(str, Enum):
     ON_TASK = 'ON_TASK'
+    INDIRECTLY_RELATED = 'INDIRECTLY_RELATED'
     UNCERTAIN = 'UNCERTAIN'
     OFF_TASK = 'OFF_TASK'
     IDLE = 'IDLE'
@@ -95,7 +96,7 @@ class DistractionMeter:
         self.updated, self.previous_state = now, state
         if state is ActivityState.OFF_TASK:
             self.score = min(100.0, self.score + self.gain * elapsed * weight)
-        elif state is ActivityState.ON_TASK:
+        elif state in (ActivityState.ON_TASK, ActivityState.INDIRECTLY_RELATED):
             self.score = max(0.0, self.score - self.recovery * elapsed * weight)
         old = self.level
         level = int(old)

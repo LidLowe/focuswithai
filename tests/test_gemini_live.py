@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import io
 import json
 import os
 import sys
@@ -14,7 +15,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from context_stream import ContextStream
-from activity_context import Frame
+from activity_context import ContextAggregator, Frame, Privacy, sprint_context
 from live_session import LivePolicyClose, LiveSession, LiveSetupError
 from panel import Panel, probe_gemini_live
 from focus_meter import Foreground
@@ -555,6 +556,60 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('Excluded application fixture', wire_text)
         self.assertNotIn('secret-example.exe', wire_text)
 
+    async def test_websocket_carries_full_sprint_fields_and_separate_prompts(self):
+        fields = {key: (key + '\n' + 'и' * 8192)[:8188] + 'TAIL'
+                  for key in ('goal', 'description', 'expected_outcome', 'context')}
+        preferences = 'Classify by the sprint evidence.\n' + 'Ж' * 8000 + ' CRITERIA_TAIL'
+        style = 'Use plain language.\n' + 'a' * 8000 + ' VOICE_TAIL'
+        config = {'activity_allow_remote': True, 'google_assistant_api_key': 'fixture',
+                  'activity_classification_prompt': preferences, 'gemini_live_prompt': style}
+        received = {}
+        completed = asyncio.Event()
+
+        async def endpoint(request):
+            socket = web.WebSocketResponse()
+            await socket.prepare(request)
+            setup = (await socket.receive_json())['setup']
+            received['instructions'] = setup['systemInstruction']['parts'][0]['text']
+            await socket.send_json({'setupComplete': {}})
+            turn = (await socket.receive_json())['clientContent']['turns'][0]['parts'][0]['text']
+            received['context'] = json.loads(turn)['context_updates']['SPRINT_STARTED']
+            await socket.send_json({'toolCall': {'functionCalls': [{
+                'id': 'fixture', 'name': REPORT, 'args': {
+                    'assessment': ASSESSMENT, 'commentary_kind': 'NONE', 'commentary_text': '',
+                },
+            }]}})
+            await socket.receive_json()
+            await socket.send_json({'serverContent': {'turnComplete': True}})
+            completed.set()
+            async for _ in socket:
+                pass
+            return socket
+
+        upstream = web.Application()
+        upstream.router.add_get('/ws', endpoint)
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SprintManager(Path(tmp) / 'sprints.json')
+            sprint = store.command('quick_start', fields)
+            now = time.monotonic()
+            session = LiveSession(config, lambda _: None, lambda: None, lambda: GeminiLiveTransport(config))
+            async with TestServer(upstream) as server:
+                with patch('gemini_live.ENDPOINT', str(server.make_url('/ws'))):
+                    try:
+                        session.start(sprint['id'], sprint_context(store.llm_context))
+                        session.observe({'application': 'editor.exe', 'window_title': 'Fixture', 'browser': None,
+                                         'media': None, 'user_apps': [], 'activity_seconds': 4}, None, 'editor', now)
+                        await asyncio.wait_for(completed.wait(), 3)
+                        await until(lambda: session.result is not None)
+                    finally:
+                        await session.close()
+        self.assertEqual(received['context'], json.loads(store.llm_context))
+        lines = received['instructions'].splitlines()
+        for prefix, value in (('Classification Prompt ', preferences), ('Voice Style ', style)):
+            index = next(i for i, line in enumerate(lines) if line.startswith(prefix))
+            self.assertEqual(json.loads(lines[index + 1]), value)
+        self.assertIn('output protocol and safety rules are mandatory', received['instructions'])
+
     def real_config(self):
         from config_store import GEMINI_KEY, read_secret
         path = Path('config.json')
@@ -570,7 +625,6 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
     @unittest.skipUnless(os.environ.get('FOCUSWITHAI_TEST_GOOGLE') == '1', 'opt-in Google API test')
     async def test_real_gemini_sprint_and_native_audio(self):
         config = self.real_config()
-        import io
         from PIL import Image, ImageDraw
         image = Image.new('RGB', (320, 160), 'white')
         ImageDraw.Draw(image).multiline_text((10, 10), 'Synthetic programming exercise\n\ndef example_function():\n    return 42',
@@ -583,7 +637,6 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(os.environ.get('FOCUSWITHAI_TEST_GOOGLE') == '1', 'opt-in Google visual-understanding test')
     async def test_real_gemini_reads_random_number_from_jpeg(self):
-        import io
         import secrets
         from PIL import Image, ImageDraw, ImageFont
 
@@ -598,7 +651,7 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
         frame = Frame(output.getvalue(), b'', image.width, image.height, time.monotonic())
 
         config = {**config, 'activity_send_remote_images': True, 'live_proactive': False,
-                  'gemini_live_prompt': 'For this synthetic calibration, put the eight digits you see in the attached '
+                  'activity_classification_prompt': 'For this synthetic calibration, put the eight digits you see in the attached '
                                        'image into observed_activity exactly, using only digits. If no digits are visible, use UNKNOWN.'}
         session = LiveSession(config, lambda _: None, lambda: None, lambda: GeminiLiveTransport(config))
         goal = {'goal': 'Read the calibration number from the current image.'}
@@ -613,3 +666,120 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(session.result.observed_activity, marker)
         finally:
             await session.close()
+
+
+    async def classify_synthetic_window(self, config, sprint, screen, seconds):
+        from PIL import Image, ImageDraw, ImageFont
+
+        title, lines = screen
+        image = Image.new('RGB', (1120, 590), '#f7f8fc')
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((0, 0, 1120, 88), fill='#202c48')
+        draw.text((34, 24), title, fill='white', font=ImageFont.load_default(size=34))
+        font = ImageFont.load_default(size=25)
+        for i, line in enumerate(lines):
+            draw.text((48, 125 + 57 * i), line, fill='#182238', font=font)
+        output = io.BytesIO()
+        image.save(output, format='JPEG', quality=90)
+        config = {**config, 'activity_send_remote_images': True, 'live_proactive': False}
+        session = LiveSession(config, lambda _: None, lambda: None, lambda: GeminiLiveTransport(config))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                store = SprintManager(Path(tmp) / 'sprints.json')
+                created = store.command('quick_start', sprint)
+                now = time.monotonic()
+                source = ContextAggregator(Privacy({}))
+                source.sample(now - seconds, Foreground(title='Fixture tab', executable='chrome.exe'))
+                facts, _ = source.snapshot(now, store.llm_context, 0)
+                self.assertEqual(facts['activity_seconds'], seconds)
+                session.start(created['id'], facts['sprint'])
+                session.observe(facts, Frame(output.getvalue(), b'', *image.size, now), 'fixture-window', now)
+                await until(lambda: session.result is not None or session.error, timeout=60)
+                self.assertIsNotNone(session.result, session.error)
+                self.assertEqual(session.frames, 1)
+                return session.result
+        finally:
+            await session.close()
+
+    @unittest.skipUnless(os.environ.get('FOCUSWITHAI_TEST_GOOGLE') == '1', 'opt-in Google classification test')
+    async def test_real_gemini_distinguishes_study_tool_setup_and_dashboard_use(self):
+        config = {**self.real_config(), 'activity_classification_prompt': '',
+                  'gemini_live_prompt': 'Use a calm, technical tone in spoken commentary.'}
+        study = {'goal': 'Study RC, RL and RLC circuits.',
+                 'description': 'Read the theory, then simulate the circuit responses in LTspice.',
+                 'expected_outcome': 'Explain time constants, damping and resonance.'}
+        development = {'goal': 'Develop FocusWithAI and fix its Dashboard settings form.',
+                       'context': 'Debug the JavaScript form and confirm the saved resolution is restored.'}
+        cases = [
+            ('ON_TASK', study, 90, ('Electrical engineering lesson: RC, RL and RLC circuits', [
+                'RC step response and the charge time constant tau = R C',
+                'RL current rise: the time constant is L / R',
+                'RLC natural response: damping and resonant frequency',
+                'Example 4: compare overdamped and underdamped step responses.',
+            ])),
+            ('INDIRECTLY_RELATED', study, 75, ('LTspice — simulation tool setup', [
+                'Preferences | Waveforms | Solver configuration',
+                'Prepare LTspice for the upcoming RC, RL and RLC circuit lab.',
+                'Setting transient analysis defaults and adding component libraries.',
+                'No schematic run or simulation output yet.',
+            ])),
+            ('UNCERTAIN', study, 8, ('FocusWithAI — current sprint Dashboard', [
+                'Goal: Study RC, RL and RLC circuits.',
+                'Status: active        Elapsed: 12:15',
+                'Pause        Take a break        Complete',
+            ])),
+            ('OFF_TASK', study, 240, ('FocusWithAI — Dashboard settings', [
+                'Active sprint: Study RC, RL and RLC circuits.',
+                'Editing settings: HUD opacity 72%, window corner bottom right.',
+                'Startup options and audio pack preferences are open.',
+                'Four changes pending.      Save changes        Preview chime',
+            ])),
+            ('ON_TASK', development, 115, ('DevTools — Debugging FocusWithAI Dashboard', [
+                'panel_web/app.js: Populate settings form from saved config.',
+                'Breakpoint: capture preset reset after reload.',
+                'Regression test: saving Full HD must preserve the chosen resolution.',
+                'Inspecting event handler and configuration API response.',
+            ])),
+        ]
+        for index, (expected, sprint, seconds, screen) in enumerate(cases):
+            with self.subTest(screen=screen[0]):
+                result = await self.classify_synthetic_window(config, sprint, screen, seconds)
+                print(f'{screen[0]} / {seconds}s: {result.classification.value} — {result.reason}', flush=True)
+                self.assertEqual(result.classification, expected)
+                if index == 3:
+                    self.assertLessEqual(result.relevance, .40)
+
+    @unittest.skipUnless(os.environ.get('FOCUSWITHAI_TEST_GOOGLE') == '1', 'opt-in Google long-context test')
+    async def test_real_gemini_reads_tails_of_long_prompt_and_all_sprint_fields(self):
+        import secrets
+
+        def long_text(start, tail):
+            padding = 'Reserved area for ordinary notes about the same lab exercise. '
+            return start + (padding * 160)[:8192 - len(start) - len(tail)] + tail
+
+        field_names = ('goal', 'description', 'expected_outcome', 'context')
+        codes = {key: f'{prefix}{secrets.randbelow(10**7):07d}'
+                 for key, prefix in zip((*field_names, 'prompt'), ('G', 'D', 'O', 'C', 'P'))}
+        sprint = {key: long_text(
+            'Review the visible calibration registry entry for the current lab ticket.\n',
+            f'\n{key} verification identifier: {codes[key]}.',
+        ) for key in field_names}
+        preferences = long_text(
+            'For a calibration registry observation, the task is direct progress. Explain your decision in reason '
+            'with one short Russian sentence citing the four verification identifiers at the ends of the goal, '
+            'description, expected_outcome, and context, and your own policy identifier at the end of this prompt. '
+            'Use all five exact identifiers as evidence for this calibration.\n',
+            f'\nPolicy identifier: {codes["prompt"]}.',
+        )
+        self.assertTrue(all(len(value) == 8192 for value in (*sprint.values(), preferences)))
+        result = await self.classify_synthetic_window(
+            {**self.real_config(), 'activity_classification_prompt': preferences,
+             'gemini_live_prompt': 'Spoken commentary should use a calm tone and omit numbers.'},
+            sprint, ('Local QA — calibration registry', [
+                'Ticket: calibrate the current activity review',
+                'Viewing the registry entry required for the current lab.',
+                'Review the corresponding verification identifiers for this ticket.',
+            ]), 90,
+        )
+        self.assertEqual(result.classification, 'ON_TASK')
+        self.assertTrue(all(code in result.reason for code in codes.values()), result.reason)

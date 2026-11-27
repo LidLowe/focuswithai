@@ -14,7 +14,7 @@ from focus_meter import numeric
 
 COLORS = {'NORMAL': '#72DC96', 'ATTENTION': '#F0CD6D', 'WARNING': '#FF9C57', 'CRITICAL': '#FF666D',
           'NEUTRAL': '#A9B8C3'}
-ACTIVITY = {'ON_TASK': 'В работе', 'UNCERTAIN': 'Уточняю активность', 'OFF_TASK': 'Отвлечение',
+ACTIVITY = {'ON_TASK': 'В работе', 'INDIRECTLY_RELATED': 'Связано с целью', 'UNCERTAIN': 'Уточняю активность', 'OFF_TASK': 'Отвлечение',
             'IDLE': 'Бездействие', 'BREAK': 'Перерыв', 'PAUSED': 'На паузе'}
 SPRINT_STATES = {'ACTIVE': 'Активен', 'PAUSED': 'На паузе', 'BREAK': 'Перерыв'}
 _IDS = count()
@@ -235,9 +235,6 @@ class FocusHUD:
             show_meter = self.show_distraction and state['meter_enabled'] and bool(sprint)
             activity = ACTIVITY.get(state['activity'], '')
             live = state['live_engine']
-            result = live['result']
-            if result and result['classification'] == 'INDIRECTLY_RELATED' and state['activity'] == 'ON_TASK':
-                activity = 'Связано с целью'
             health = 'Gemini · ' + live['connection_state']
             last_success = live['last_success']
             stamp = time.strftime('%H:%M:%S', time.localtime(last_success)) if last_success else ''

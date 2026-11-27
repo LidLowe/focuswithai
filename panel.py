@@ -14,10 +14,12 @@ from typing import Any, Dict, List, Optional
 
 from aiohttp import web
 from activity_context import CAPTURE_LIMITS, validate_context_settings
+from activity_protocol import PROMPT_LIMITS, validate_prompts
 from audio_import import save_clip
 from config_store import DEFAULT_PORT, SECRET_KEYS, VERSION, defaults, load_config, public_config, save_config
 from gemini_live import MODELS, VOICES, GeminiLiveTransport, validate_preferences
 from live_session import LiveSession
+from sprints import SPRINT_TEXT_LIMITS
 from startup_manager import StartupTask
 from voicepack import (AlarmEngine, ClipPlayer, DEFAULTS as VOICEPACK_DEFAULTS, Event, MAX_CLIP_BYTES,
                        PlaybackStopped, VoicePackCatalog, VoicePackEngine)
@@ -194,6 +196,7 @@ def write_config(config: Dict[str, Any]):
         raise ValueError('Неподдерживаемая версия конфигурации.')
     validate_preferences(config)
     validate_context_settings(config)
+    validate_prompts(config)
     if os.path.exists(CONFIG_FILE):
         backup_config()
     save_config(config)
@@ -376,6 +379,8 @@ class Panel:
             'config': mask_config(config),
             'defaults': defaults(),
             'capture_limits': CAPTURE_LIMITS,
+            'sprint_text_limits': SPRINT_TEXT_LIMITS,
+            'prompt_limits': PROMPT_LIMITS,
             'models': MODELS, 'voices': VOICES,
             'mtime': os.path.getmtime(CONFIG_FILE) if os.path.exists(CONFIG_FILE) else None,
             'live': self.rt is not None,
@@ -466,7 +471,8 @@ class Panel:
 
 async def probe_gemini_live(config, through):
     """Exercise the production send/receive loop with a disposable synthetic sprint."""
-    config = {**config, 'gemini_live_prompt': '', 'activity_send_remote_images': False, 'live_proactive': False}
+    config = {**config, 'gemini_live_prompt': '', 'activity_classification_prompt': '',
+              'activity_send_remote_images': False, 'live_proactive': False}
     transport = None
     stages = {name: {'status': 'skipped'} for name in ('connection', 'classification', 'audio')}
     def factory():

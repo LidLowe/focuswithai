@@ -11,7 +11,8 @@ from pathlib import Path
 
 OPEN = {'ACTIVE', 'PAUSED', 'BREAK'}
 FINISHED = {'COMPLETED', 'CANCELLED'}
-FIELDS = ('title', 'goal', 'description', 'expected_outcome', 'context', 'subtasks', 'duration_minutes')
+SPRINT_TEXT_LIMITS = {'title': 160, 'goal': 8192, 'description': 8192, 'expected_outcome': 8192, 'context': 8192}
+FIELDS = (*SPRINT_TEXT_LIMITS, 'subtasks', 'duration_minutes')
 
 
 def clean(value, limit):
@@ -21,12 +22,16 @@ def clean(value, limit):
 
 
 def definition(data):
-    result = {key: clean(data.get(key, ''), limit) for key, limit in (
-        ('title', 160), ('goal', 500), ('description', 2000), ('expected_outcome', 1000), ('context', 2000),
-    )}
-    if not result['goal']:
+    result = {}
+    for key, limit in SPRINT_TEXT_LIMITS.items():
+        value = data.get(key, '')
+        if not isinstance(value, str) or len(value) > limit:
+            raise ValueError(f'{key} — ожидается текст до {limit} символов.')
+        result[key] = value
+    goal = result['goal'].strip()
+    if not goal:
         raise ValueError('Укажи цель спринта.')
-    result['title'] = result['title'] or result['goal'][:160]
+    result['title'] = result['title'].strip() or goal[:SPRINT_TEXT_LIMITS['title']]
     duration = data.get('duration_minutes')
     if duration is not None and (type(duration) is not int or not 1 <= duration <= 1440):
         raise ValueError('Длительность должна быть от 1 до 1440 минут или без ограничения.')
@@ -223,7 +228,7 @@ class SprintManager:
             original = {key: item[key] for key in FIELDS}
             changes = {key: body[key] for key in FIELDS if key in body}
             if ('goal' in changes and changes.get('title', item['title']) == item['title']
-                    and item['title'] == item['goal'][:160]):
+                    and item['title'] == item['goal'].strip()[:SPRINT_TEXT_LIMITS['title']]):
                 changes['title'] = ''
             values = {**original, 'subtasks': [task['text'] for task in item['subtasks']], **changes}
             fields = definition(values)

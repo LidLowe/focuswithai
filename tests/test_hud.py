@@ -50,7 +50,7 @@ class HudTests(unittest.TestCase):
             try:
                 hud.update({
                     'sources': {'capture_active': False}, 'sprint': None, 'meter_enabled': False,
-                    'activity': 'ON_TASK', 'score': 0, 'level': 'NORMAL', 'task': '',
+                    'activity': 'INDIRECTLY_RELATED', 'score': 0, 'level': 'NORMAL', 'task': '',
                     'live_engine': {'connection_state': 'CONNECTED', 'last_success': None,
                                     'result': {'classification': 'INDIRECTLY_RELATED'}},
                 }, None)

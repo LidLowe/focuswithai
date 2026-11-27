@@ -25,6 +25,7 @@ CONTEXT_DEFAULTS = {
     'live_proactive': False,
     'context_allowed_apps': [],
     'activity_allow_remote': False,
+    'activity_classification_prompt': '',
     'activity_send_remote_images': False,
     'activity_min_confidence': .75,
     'activity_confirmation_seconds': 5,
@@ -188,8 +189,8 @@ class Privacy:
 
 
 def sprint_context(sprint):
-    return {key: ([{'text': clean(task['text'], 120), 'done': task['done']} for task in value[:15]]
-                  if key == 'subtasks' else clean(value, 650) if isinstance(value, str) else value)
+    return {key: ([{'text': SECRET.sub('[redacted]', task['text']), 'done': task['done']} for task in value]
+                  if key == 'subtasks' else SECRET.sub('[redacted]', value) if isinstance(value, str) else value)
             for key, value in json.loads(sprint).items()}
 
 

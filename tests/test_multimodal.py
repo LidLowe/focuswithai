@@ -78,12 +78,26 @@ class ObservationTests(unittest.TestCase):
                 Result.parse(json.dumps({**json.loads(response()), **invalid}))
         self.assertEqual(Result.parse(response()).classification, Classification.OFF_TASK)
 
+    def test_supporting_work_recovers_half_as_fast_as_direct_progress(self):
+        decision = DecisionEngine({})
+        scores = {}
+        for label in ('ON_TASK', 'INDIRECTLY_RELATED'):
+            result = Result.parse(response(label, .85, .9))
+            state, weight, confirmed = decision.evaluate(0, result, 1, ())
+            self.assertFalse(confirmed)
+            meter = DistractionMeter({'focus_recovery_per_second': 10})
+            meter.score = 50
+            meter.advance(0, state, weight)
+            meter.advance(1, state, weight)
+            scores[label] = meter.score
+        self.assertEqual(scores, {'ON_TASK': 41, 'INDIRECTLY_RELATED': 45.5})
+
     def test_workflow_decisions_and_delayed_warnings(self):
         statuses = {
             'IDE for sprint goal': ('ON_TASK', 1, .93, ActivityState.ON_TASK),
-            'relevant technical docs': ('INDIRECTLY_RELATED', .8, .93, ActivityState.ON_TASK),
+            'necessary tool setup': ('INDIRECTLY_RELATED', .8, .93, ActivityState.INDIRECTLY_RELATED),
             'unrelated technical docs': ('OFF_TASK', .1, .93, ActivityState.OFF_TASK),
-            'tutorial video': ('INDIRECTLY_RELATED', .8, .93, ActivityState.ON_TASK),
+            'tutorial video on sprint topic': ('ON_TASK', .8, .93, ActivityState.ON_TASK),
             'background music': ('ON_TASK', 1, .93, ActivityState.ON_TASK),
             'game unrelated to sprint': ('OFF_TASK', 0, .98, ActivityState.OFF_TASK),
             'brief switch': ('OFF_TASK', .1, .59, ActivityState.UNCERTAIN),
@@ -150,6 +164,21 @@ class ObservationTests(unittest.TestCase):
                 config = load_config(path)
             self.assertFalse(config['activity_allow_remote'])
             self.assertFalse(config['activity_send_remote_images'])
+
+    def test_prompt_settings_validate_and_preserve_exact_values(self):
+        classification = 'Подход к оценке:\n' + 'Я' * 8100 + ' CONCLUSION'
+        voice = '  Спокойная манера.\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.json'
+            with patch('config_store.read_secret', return_value=''), patch('config_store.store_secret'):
+                save_config({'activity_classification_prompt': classification, 'gemini_live_prompt': voice}, path)
+                self.assertEqual(load_config(path)['activity_classification_prompt'], classification)
+                self.assertEqual(load_config(path)['gemini_live_prompt'], voice)
+                saved = path.read_bytes()
+                for key, value in (('activity_classification_prompt', 'x' * 8193), ('gemini_live_prompt', 42)):
+                    with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
+                        save_config({key: value}, path)
+                    self.assertEqual(path.read_bytes(), saved)
 
     def test_configuration_migration_removes_manual_capture_and_preserves_image_consent(self):
         with tempfile.TemporaryDirectory() as tmp:
