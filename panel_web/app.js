@@ -48,7 +48,7 @@ const S = {
   status: null, statusAt: 0, conn: true,
   route: 'current', loaded: {}, open: {},
   audioPacks: { alarm: [], voice: [], events: [] }, audioEvents: {}, audioFiles: {},
-  startup: null,
+  startup: null, performance: null, performanceWindow: '5m', performanceLoading: false,
   sprints: null, sprintEdit: null, sprintForm: null,
   logs: [], logSeq: 0, logPaused: false,
   busy: {},
@@ -289,7 +289,7 @@ function lwAdd(el, value) {
 const NAV = [
   ['Работа', [['current', 'Текущий спринт'], ['history', 'История спринтов'], ['activity', 'Контекст активности']]],
   ['Фокус', [['live', 'Gemini Live'], ['intervention', 'Вмешательства'], ['voice', 'Сигналы и голосовые пакеты'], ['focus', 'HUD']]],
-  ['Система', [['startup', 'Автозапуск'], ['diagnostics', 'Диагностика']]],
+  ['Система', [['startup', 'Автозапуск'], ['diagnostics', 'Диагностика'], ['performance', 'Производительность']]],
 ];
 const TITLES = Object.fromEntries(NAV.flatMap(([, items]) => items));
 
@@ -785,6 +785,186 @@ PAGES.activity = {
   },
 };
 
+const PERF_WINDOWS = {'1m': '1 мин', '5m': '5 мин', '15m': '15 мин', sprint: 'Текущий спринт', recording: 'Вся запись'};
+const PERF_COUNTERS = {
+  frames_captured: 'Получено JPEG', frames_sent: 'Отправлено JPEG', frames_deduplicated: 'Дубликаты',
+  frames_dropped: 'Пропуски кадров', classifications_ok: 'Принято оценок', classifications_failed: 'Ошибки оценок',
+  classifications_stale: 'Устаревшие оценки', reconnects: 'Переподключения', timeouts: 'Тайм-ауты',
+  ws_in_bytes: 'Входящие байты WS', ws_out_bytes: 'Исходящие байты WS', base64_bytes: 'Байты Base64',
+  jpeg_sent_bytes: 'Байты отправленных JPEG', serialized_turn_bytes: 'Байты JSON ходов',
+};
+const PERF_TOKENS = {
+  promptTokenCount: 'Промпт', responseTokenCount: 'Ответ', totalTokenCount: 'Всего по API',
+  cachedContentTokenCount: 'Кэш промпта', thoughtsTokenCount: 'Размышления', toolUsePromptTokenCount: 'Ввод инструментов',
+};
+const perfNum = (value, digits = 2) => Number.isFinite(value) ? value.toLocaleString('ru-RU', {maximumFractionDigits: digits}) : '—';
+const perfSize = (value) => Number.isFinite(value) ? perfNum(value / 1024) + ' КиБ' : '—';
+const perfDims = (value) => value ? value.join('×') : '—';
+
+function perfGrid(fields) {
+  return `<div class="activity-grid">${fields.map(([name, value]) =>
+    `<div><span class="note">${esc(name)}</span><b>${esc(value)}</b></div>`).join('')}</div>`;
+}
+
+function performanceView() {
+  const data = S.performance;
+  if (!data) return '<section class="card pad"><p class="note">Загружаю данные профайлера…</p></section>';
+  if (data.error) return `<section class="card pad"><p role="alert">${esc(data.error)}</p></section>`;
+  const buttons = `<div class="inl">
+    ${data.running ? '<button class="btn" data-act="profile" data-command="stop">Остановить запись</button>' :
+      '<button class="btn dark" data-act="profile" data-command="start">Начать запись</button>'}
+    ${data.recording_id ? '<button class="btn" data-act="profile" data-command="reset">Сбросить статистику</button>' +
+      '<a class="btn" href="/api/performance/export/csv" download>CSV</a><a class="btn" href="/api/performance/export/json" download>JSON</a>' : ''}
+    </div>`;
+  if (!data.recording_id) return `<section class="card pad">${buttons}
+    <p class="note">Профайлер выключен. Записываются только числовые замеры и идентификаторы.</p></section>`;
+  const stats = data.windows[S.performanceWindow];
+  const frames = stats.counters;
+  const duration = stats.seconds;
+  const resources = data.resources || {};
+  const frame = data.frame || {};
+  const latest = data.usage || {};
+  const overhead = data.overhead || {};
+  const rates = (key, size = false) => duration ? (size ? perfSize(frames[key] / duration || 0) : perfNum(frames[key] / duration || 0)) + '/с' : '—';
+  const metrics = Object.entries(data.metrics).filter(([key]) => stats.metrics[key]);
+  const advanced = Object.entries(frames).filter(([key]) => !Object.hasOwn(PERF_COUNTERS, key)
+    && !Object.hasOwn(PERF_TOKENS, key) && key !== 'token_turns');
+  return `<section class="card pad">
+    ${buttons}
+    ${perfGrid([['Запись', data.running ? 'Идёт' : 'Остановлена'], ['Длительность записи', fmtMS(data.duration_seconds)],
+      ['Модель', data.model], ['CPU процесса · 100% на ядро', Number.isFinite(resources.cpu_percent_one_core) ? perfNum(resources.cpu_percent_one_core) + '%' : '—'],
+      ['RAM · рабочий набор', Number.isFinite(resources.working_set_bytes) ? perfNum(resources.working_set_bytes / 1048576) + ' МиБ' : '—'],
+      ['Последний захват окна', perfDims(frame.source)], ['Последний JPEG', perfDims(frame.jpeg)],
+      ['Качество JPEG', frame.quality ?? data.config.capture_quality], ['Размер JPEG', perfSize(frame.bytes)],
+      ['Помещение в очередь профайлера · среднее / максимум', perfNum(overhead.enqueue_mean_us) + ' / ' + perfNum(overhead.enqueue_max_us) + ' мкс'],
+      ['CPU фонового агрегатора', perfNum(overhead.worker_cpu_ms) + ' мс'],
+      ['Потери замеров · переполнение / старые строки экспорта', (data.records_dropped || 0) + ' / ' + (data.records_evicted || 0)]])}
+    </section>
+    <section class="card pad">
+      <div class="inl"><h2>Задержки конвейера</h2>
+      <label>Период <select class="field sm" data-performance-window>
+        ${Object.entries(PERF_WINDOWS).map(([key, label]) => `<option value="${key}"${key === S.performanceWindow ? ' selected' : ''}>${label}</option>`).join('')}
+      </select></label></div>
+      ${metrics.length ? `<div class="performance-table"><table><thead><tr><th>Этап · мс</th><th>N</th><th>Min</th><th>Max</th>
+        <th>Среднее</th><th>P50</th><th>P90</th><th>P95</th><th>P99</th><th>σ</th></tr></thead><tbody>
+        ${metrics.map(([key, label]) => `<tr><th scope="row">${esc(label)}</th>${['count','min','max','mean','p50','p90','p95','p99','stddev']
+          .map(name => `<td>${perfNum(stats.metrics[key][name], name === 'count' ? 0 : 3)}</td>`).join('')}</tr>`).join('')}
+        </tbody></table></div>` : '<p class="note">За этот период пока нет замеров.</p>'}
+      <p class="note">Процентили приблизительны. Границы периодов округлены до 5 с. Ответ Gemini включает сеть и сервер. Звук измеряется до передачи микшеру.</p>
+    </section>
+    <section class="card pad">
+      <h2>История · до 15 мин · шаг ${data.history_bucket_seconds} с</h2>
+      <div class="performance-charts">
+        <div><h3>Задержка · P50, мс</h3><canvas data-perf-chart="latency" aria-label="История задержек" role="img"></canvas></div>
+        <div><h3>Кадры в секунду</h3><canvas data-perf-chart="frames" aria-label="Пропускная способность кадров" role="img"></canvas></div>
+        <div><h3>WebSocket · КиБ/с</h3><canvas data-perf-chart="network" aria-label="Пропускная способность WebSocket" role="img"></canvas></div>
+      </div>
+    </section>
+    <section class="card pad">
+      <h2>Счётчики и токены · ${esc(PERF_WINDOWS[S.performanceWindow])}</h2>
+      ${perfGrid([['Частота захвата', rates('frames_captured')], ['Частота отправки', rates('frames_sent')],
+        ['Входящий трафик', rates('ws_in_bytes', true)], ['Исходящий трафик', rates('ws_out_bytes', true)],
+        ...Object.entries(PERF_COUNTERS).map(([key,label]) => [label, perfNum(frames[key] || 0, 0)])])}
+      ${advanced.length ? `<details><summary>Категории событий</summary>${perfGrid(advanced.map(([name, value]) => [name, perfNum(value, 0)]))}</details>` : ''}
+      <h3>Токены Gemini по завершённым ходам · ${perfNum(frames.token_turns || 0, 0)}</h3>
+      ${perfGrid(Object.entries(PERF_TOKENS).map(([key, label]) => [label, perfNum(frames[key], 0)]))}
+      ${latest.fields ? `<p class="note">Последние данные API · ход ${esc(latest.turn_id)} · ${latest.final ? 'завершён' : 'частичный'}
+        · ${Object.entries(latest.fields).map(([key,value]) => esc((PERF_TOKENS[key] || key) + ' ' + value)).join(' · ')}</p>` : ''}
+      <p class="note">Промпт может включать историю и кэш. Суммы токенов не являются расчётом стоимости.</p>
+    </section>`;
+}
+
+const PERF_CHARTS = {
+  latency: [['Весь путь', '#214c95', h => h.latency_ms.capture_to_classification],
+            ['Ответ Gemini', '#b94723', h => h.latency_ms.classification],
+            ['Предыдущий ход', '#7650a2', h => h.latency_ms.previous_turn],
+            ['PCM → микшер', '#267c57', h => h.latency_ms.audio_local]],
+  frames: [['Захват', '#214c95', (h, dt) => h.captured / dt],
+           ['Отправка', '#267c57', (h, dt) => h.frames / dt]],
+  network: [['Исходящие', '#214c95', (h, dt) => h.out_bytes / 1024 / dt],
+            ['Входящие', '#b94723', (h, dt) => h.in_bytes / 1024 / dt]],
+};
+
+function drawPerformance() {
+  const snapshots = S.performance?.history || [];
+  const span = S.performance?.history_bucket_seconds || 5;
+  const end = S.performance?.duration_seconds || 0;
+  const duration = S.performance?.windows?.[S.performanceWindow]?.seconds || 0;
+  const start = Math.max(0, end - Math.min(900, duration));
+  const data = duration ? snapshots.filter(row => row.second + span >= start) : [];
+  $$('[data-perf-chart]').forEach(canvas => {
+    const width = canvas.clientWidth || 360;
+    const height = canvas.clientHeight || 160;
+    const scale = Math.min(devicePixelRatio || 1, 2);
+    canvas.width = width * scale;
+    canvas.height = height * scale;
+    const ctx = canvas.getContext('2d');
+    ctx.scale(scale, scale);
+    ctx.font = '11px system-ui';
+    const series = PERF_CHARTS[canvas.dataset.perfChart];
+    let max = 0;
+    for (const [, , value] of series) {
+      for (const row of data) max = Math.max(max, value(row, span) || 0);
+    }
+    if (!data.length || !max) {
+      ctx.fillStyle = '#667085';
+      ctx.fillText('Пока нет данных', 8, 22);
+      return;
+    }
+    const left = 42, right = width - 8, top = 12, bottom = height - 57;
+    for (let i = 0; i <= 2; i++) {
+      const line = top + (bottom - top) * i / 2;
+      ctx.strokeStyle = '#c4cbd4';
+      ctx.beginPath(); ctx.moveTo(left, line); ctx.lineTo(right, line); ctx.stroke();
+      ctx.fillStyle = '#667085'; ctx.fillText(perfNum(max * (1 - i / 2), 1), 2, line + 3);
+    }
+    ctx.fillStyle = '#667085';
+    const from = fmtMS(start), to = fmtMS(end);
+    ctx.fillText(from, left, bottom + 13);
+    ctx.fillText(to, right - ctx.measureText(to).width, bottom + 13);
+    for (const [index, [label, color, value]] of series.entries()) {
+      ctx.beginPath(); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 1.6;
+      let previous = null;
+      for (const row of data) {
+        const n = value(row, span);
+        if (!Number.isFinite(n)) { previous = null; continue; }
+        const x = left + (right - left) * Math.max(0, row.second - start) / Math.max(span, end - start);
+        const y = bottom - n / max * (bottom - top);
+        if (previous === null || row.second - previous > span + .1) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+        ctx.fillRect(x - 1.5, y - 1.5, 3, 3);
+        previous = row.second;
+      }
+      ctx.stroke();
+      const legendWidth = width < 420 ? width / 2 : width / series.length;
+      ctx.fillText(label, (index % (width < 420 ? 2 : series.length)) * legendWidth + 4,
+        bottom + 29 + Math.floor(index / (width < 420 ? 2 : series.length)) * 15);
+    }
+  });
+}
+
+function refreshPerformanceView() {
+  const node = $('[data-performance]');
+  if (node) { setHtml(node, performanceView()); drawPerformance(); }
+}
+
+async function pollPerformance() {
+  if (S.performanceLoading) return;
+  S.performanceLoading = true;
+  try { S.performance = await api('/api/performance'); }
+  catch (error) { S.performance = {error: error.message}; }
+  finally { S.performanceLoading = false; }
+  if (S.route === 'performance') refreshPerformanceView();
+}
+
+PAGES.performance = {
+  after: pollPerformance,
+  render() {
+    return `<header class="ph"><h1>Производительность</h1></header>
+      <div class="performance-page" data-performance>${performanceView()}</div>`;
+  },
+};
+
 PAGES.diagnostics = {
   narrow: true,
   after() { renderLogs(true); },
@@ -1088,6 +1268,17 @@ async function busy(key, fn) {
 }
 
 const ACTIONS = {
+  async profile(el) {
+    if (S.performanceLoading) return;
+    const action = el.dataset.command;
+    if (action === 'reset' && !confirm('Сбросить записанные замеры?')) return;
+    S.performanceLoading = true;
+    try {
+      S.performance = await api('/api/performance', {method: 'POST', body: {action}});
+      refreshPerformanceView();
+    } catch (e) { toast(e.message, {bad: true}); }
+    finally { S.performanceLoading = false; }
+  },
   save: saveAll,
   async contextpreview() {
     try {
@@ -1290,6 +1481,11 @@ document.addEventListener('change', async (e) => {
     }
     return;
   }
+  if (el.matches('[data-performance-window]')) {
+    S.performanceWindow = el.value;
+    refreshPerformanceView();
+    return;
+  }
   if (el.dataset.audioEvent) { S.audioEvents[el.dataset.audioEvent] = el.value; delete S.audioFiles[el.dataset.audioEvent]; render(); return; }
   if (el.dataset.audioFile) { S.audioFiles[el.dataset.audioFile] = el.value; return; }
   if (el.dataset.notificationEvent) {
@@ -1373,6 +1569,8 @@ async function poll() {
       const current = document.activeElement?.dataset.ctl;
       if (setHtml(section, focusStatus(S.status)) && current) $(`[data-ctl="${current}"]`, section)?.focus();
     }
+  } else if (S.route === 'performance' && S.cfg) {
+    await pollPerformance();
   } else if (S.route === 'live' && S.cfg) {
     const section = $('[data-live-session]');
     if (section) setHtml(section, liveStatus(S.status));

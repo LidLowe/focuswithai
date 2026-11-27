@@ -29,6 +29,8 @@ import discord
 import panel
 from config_store import load_config
 from focus_meter import Foreground
+from gemini_live import DEFAULTS as GEMINI_DEFAULTS, MODELS
+from performance import PerformanceProfiler
 from focus_runtime import FocusController, Phase
 from sprints import SprintManager
 from voicepack import Event, VoicePackNotifier
@@ -124,6 +126,9 @@ class Runtime:
         self.started_at = time.time()
         self.sprints = SprintManager()
         self.voicepack = VoicePackNotifier(config)
+        model = config.get('gemini_live_model')
+        self.profiler = PerformanceProfiler(config, model if isinstance(model, str) and model in MODELS
+                                            else GEMINI_DEFAULTS['gemini_live_model'])
         self.focus = None
         self.startup_managed = os.environ.get('FOCUSWITHAI_MANAGED') == '1'
         self.startup_ready = False
@@ -138,7 +143,7 @@ class Runtime:
             self.play_focus_event, self.stop_audio, lambda: self.control('start_break'),
             observe=self.sprints.observe, on_intervention=self.sprints.intervention,
             notifier=self.voicepack, sound_enabled=lambda: sound_on,
-            get_window=None if sys.platform == 'win32' else portable_foreground,
+            profiler=self.profiler, get_window=None if sys.platform == 'win32' else portable_foreground,
         )
 
     def state(self):
@@ -302,6 +307,8 @@ async def main():
         except OSError:
             logging.exception('[Sprint] Could not save the sprint at shutdown.')
         await runtime.voicepack.close()
+        if runtime.profiler.active:
+            await asyncio.to_thread(runtime.profiler.control, 'stop')
         await panel_runner.cleanup()
         discord.stop_rpc()
 

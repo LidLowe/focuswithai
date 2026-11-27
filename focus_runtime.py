@@ -31,7 +31,7 @@ class Phase:
 
 class FocusController:
     def __init__(self, config, phase, use_ai, play, stop_audio, pause, *, notifier, sound_enabled,
-                 observe=None, on_intervention=None, get_window=None, transport_factory=None):
+                 observe=None, on_intervention=None, get_window=None, transport_factory=None, profiler=None):
         if sys.platform == 'win32':
             from focus_hud import FocusHUD
             import focus_windows
@@ -42,6 +42,7 @@ class FocusController:
 
         self.phase = phase
         self.use_ai = use_ai
+        self.profiler = profiler
         self.stop_audio = stop_audio
         self.pause = pause
         self.port = int(config.get('panel_port', 8765))
@@ -55,7 +56,7 @@ class FocusController:
         self.on_intervention = on_intervention
         self.meter_enabled = bool(config.get('focus_meter_enabled'))
         self.live = LiveFocus(config, self, notifier, sound_enabled, transport_factory=transport_factory)
-        self.acquisition = Acquisition(config, windows_acquisition)
+        self.acquisition = Acquisition(config, windows_acquisition, profiler=profiler)
         self.decision = DecisionEngine(config)
         self.meter = DistractionMeter(config)
         self.intervention = InterventionEngine(config, focus_windows, play) if sys.platform == 'win32' else None
@@ -203,6 +204,9 @@ class FocusController:
 
     def _tick(self, now):
         phase = self.phase()
+        recording = self.profiler.active if self.profiler else None
+        if recording:
+            recording.set_sprint(phase.sprint['id'] if phase.sprint else None)
         if self.last_tick is not None and now - self.last_tick > 8:
             self.suspend()
             self.meter.updated = now
@@ -222,7 +226,7 @@ class FocusController:
                            'Идёт перерыв.' if phase.sprint else 'Начни спринт в панели.')
         else:
             if now >= self.next_sample:
-                self.sample = self.monitor.sample()
+                self.sample = self.monitor.sample(recording) if recording else self.monitor.sample()
                 self.next_sample = now + 1.0
             window, idle = self.sample
             private = self.acquisition.privacy.excluded(window)

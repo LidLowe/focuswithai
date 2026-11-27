@@ -8,9 +8,10 @@ import time
 
 from activity_context import (BROWSERS, CAPTURE_LIMITS, ContextAggregator, Privacy, clean,
                               items, validate_context_settings)
+from performance import CAPTURE_REASONS, FrameTrace, clock
 
 
-def background(function, *args):
+def background(function, *args, **kwargs):
     """A potentially stalled window provider cannot hold up the event loop or exit."""
     loop = asyncio.get_running_loop()
     result = loop.create_future()
@@ -21,7 +22,7 @@ def background(function, *args):
 
     def work():
         try:
-            pair = function(*args), None
+            pair = function(*args, **kwargs), None
         except Exception as err:
             pair = None, type(err).__name__
         try:
@@ -34,8 +35,10 @@ def background(function, *args):
 
 
 class Acquisition:
-    def __init__(self, config, windows=None):
+    def __init__(self, config, windows=None, *, profiler=None):
         self.windows = windows
+        self.profiler = profiler
+        self.capture_trace = None
         self.privacy = Privacy(config)
         self.context = ContextAggregator(self.privacy)
         self.has_capture = bool(windows and importlib.util.find_spec('PIL'))
@@ -164,6 +167,27 @@ class Acquisition:
             result, error = self.capture_job.result()
             frame, reason = result if result is not None else (None, 'capture_failed')
             self.capture_job = None
+            trace, self.capture_trace = self.capture_trace, None
+            recording = self.profiler.active if trace and self.profiler else None
+            if recording and recording.id != trace.recording_id:
+                recording = None
+            if recording:
+                scope = {**recording.scope(frame=trace.frame_id), 'sprint_id': trace.sprint_id}
+                for name, (start, end) in trace.timings.items():
+                    recording.latency(name, start, end, scope)
+                if frame:
+                    recording.tally('frames_captured', scope=scope)
+                    recording.submit('frame', 'jpeg', {'source': frame.source_size, 'jpeg': (frame.width, frame.height),
+                                                        'quality': self.quality, 'bytes': len(frame.data)}, scope)
+                    if self.job_epoch != self.capture_epoch:
+                        recording.tally('frames_dropped', scope=scope)
+                        recording.tally('frame_superseded', scope=scope)
+                else:
+                    category = reason if reason in CAPTURE_REASONS else 'capture_failed'
+                    recording.tally(category if category == 'capture_failed' else 'capture_' + category, scope=scope)
+                    if 'jpeg' in trace.timings:
+                        recording.tally('frames_dropped', scope=scope)
+                        recording.tally('frame_rejected_after_capture', scope=scope)
             if self.job_epoch == self.capture_epoch:
                 self.capture_skip = 'capture_failed' if error else reason
                 self.context.frame_checked_at = frame.captured_at if frame else None
@@ -172,7 +196,13 @@ class Acquisition:
                     self.last_capture = time.time()
                     self.last_size = {'width': frame.width, 'height': frame.height, 'bytes': len(frame.data)}
                     self.last_source_size = frame.source_size
-                    if frame.differs(self.context.frame):
+                    started = clock() if recording else None
+                    distinct = frame.differs(self.context.frame)
+                    if recording:
+                        recording.latency('deduplication', started, clock(), scope)
+                        if not distinct:
+                            recording.tally('frames_deduplicated', scope=scope)
+                    if distinct:
                         self.context.frame = frame
                         self.capture_backoff = 1
                         self.next_capture = now + self.interval
@@ -195,11 +225,17 @@ class Acquisition:
             return
         self.job_epoch = self.capture_epoch
         self.next_capture = now + self.adaptive_interval
+        recording = self.profiler.active if self.profiler else None
+        args = (window, self.dimensions, self.quality)
+        capture = self.windows.capture_window
         if ntpath.basename(window.executable).casefold() in BROWSERS:
-            self.capture_job = background(self.windows.capture_browser_window, window, self.dimensions,
-                                          self.quality, self.privacy.browser_capture_reason)
+            capture = self.windows.capture_browser_window
+            args += (self.privacy.browser_capture_reason,)
+        if recording:
+            self.capture_trace = FrameTrace(recording.id, next(recording.frame_ids), recording.sprint_key)
+            self.capture_job = background(capture, *args, trace=self.capture_trace)
         else:
-            self.capture_job = background(self.windows.capture_window, window, self.dimensions, self.quality)
+            self.capture_job = background(capture, *args)
 
     def foreground_is_current(self):
         return not self.windows or self.windows.foreground() == self.context.window

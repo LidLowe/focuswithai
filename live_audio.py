@@ -3,6 +3,7 @@ import asyncio
 import io
 import wave
 
+from performance import clock
 from voicepack import PlaybackStopped
 
 
@@ -65,7 +66,7 @@ class LiveAudio:
             return 'SILENT'
         return 'SPEAKING' if self.playing else 'BUFFERING'
 
-    def start(self, response, rate, current, prelude, on_play=None):
+    def start(self, response, rate, current, prelude, on_play=None, *, profile=None):
         if self.busy or self.player.busy or type(rate) is not int or not 8000 <= rate <= 48000:
             return False
         self.response, self.rate = response, rate
@@ -73,7 +74,7 @@ class LiveAudio:
         self.ended = False
         self.error = None
         self.queue = asyncio.Queue(96)
-        self.task = asyncio.create_task(self._play(self.queue, rate, current, prelude, on_play))
+        self.task = asyncio.create_task(self._play(self.queue, rate, current, prelude, on_play, profile))
         return True
 
     async def feed_stream(self, response, data):
@@ -113,8 +114,9 @@ class LiveAudio:
         self.buffered = 0
         self.playing = False
 
-    async def _play(self, queue, rate, current, prelude, on_play):
+    async def _play(self, queue, rate, current, prelude, on_play, profile):
         sink = None
+        submitted = False
         try:
             async with self.player.sequence():
                 if not current():
@@ -133,6 +135,9 @@ class LiveAudio:
                 while chunk is not None and current():
                     self.buffered -= len(chunk)
                     await sink.write(chunk)
+                    if profile and not submitted:
+                        profile.mark('playback', clock())
+                        submitted = True
                     chunk = await asyncio.wait_for(queue.get(), 3)
                 if current():
                     await sink.drain()
@@ -140,6 +145,11 @@ class LiveAudio:
             pass
         except Exception as error:
             self.error = type(error).__name__
+            if profile:
+                profile.recording.tally('audio_error', scope=profile.scope)
+                if isinstance(error, asyncio.TimeoutError):
+                    profile.recording.tally('audio_timeout', scope=profile.scope)
+                    profile.recording.tally('timeouts', scope=profile.scope)
         finally:
             if sink:
                 sink.stop()

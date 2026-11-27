@@ -6,6 +6,7 @@ import sys
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 
+from performance import clock
 from voicepack import Event
 
 
@@ -137,8 +138,11 @@ class ActivityMonitor:
         self.get_idle = get_idle
         self.idle_threshold = idle_threshold
 
-    def sample(self):
+    def sample(self, recording=None):
+        started = clock() if recording else None
         window = self.get_window()
+        if recording:
+            recording.latency('foreground', started, clock(), recording.scope())
         seconds = self.get_idle()
         idle = seconds is not None and seconds >= self.idle_threshold
         return window, idle

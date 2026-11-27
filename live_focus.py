@@ -21,9 +21,10 @@ class LiveFocus:
         self.owner, self.notifier, self.sound_enabled = owner, notifier, sound_enabled
         volume = number(config, 'live_volume', .55, 0, 1)
         self.audio = LiveAudio(notifier.player, volume)
+        profiler = getattr(owner, 'profiler', None)
         self.session = LiveSession({**DEFAULTS, **config}, self.output, self.audio.cancel,
-                                   transport_factory or (lambda: GeminiLiveTransport(config)),
-                                   observation_current=self.current)
+                                   transport_factory or (lambda: GeminiLiveTransport(config, profiler=profiler)),
+                                   observation_current=self.current, profiler=profiler)
         self.gate = CommentaryGate(config, number(config, 'focus_cooldown_seconds', 45, 15, 300))
         self.allow_images = config.get('activity_send_remote_images') is True
         self.focus_audio = config.get('focus_audio', True)
@@ -137,7 +138,7 @@ class LiveFocus:
                 async def prelude():
                     await self.notifier.live_alarm(event)
 
-                if not self.audio.start(response, data.get('rate'), current, prelude, started):
+                if not self.audio.start(response, data.get('rate'), current, prelude, started, profile=msg.profile):
                     LOG.debug('Gemini Live commentary rejected: audio device busy or invalid format')
 
     def diagnostics(self):

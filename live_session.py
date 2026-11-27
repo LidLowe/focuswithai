@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from activity_protocol import PROTOCOL_PROMPT, SYSTEM_PROMPT, Result
 from commentary import INSTRUCTION, KINDS
 from context_stream import ContextStream, Stamp
+from performance import TurnTrace, clock
 
 
 LOG = logging.getLogger(__name__)
@@ -49,6 +50,7 @@ class Output:
     turn: int
     data: object
     response_id: str = ''
+    profile: TurnTrace | None = None
 
 
 class LiveTransport(ABC):
@@ -72,8 +74,9 @@ class LiveTransport(ABC):
 
 
 class LiveSession:
-    def __init__(self, config, on_output, cancel_audio, factory, *, observation_current=None):
-        self.stream = ContextStream()
+    def __init__(self, config, on_output, cancel_audio, factory, *, observation_current=None, profiler=None):
+        self.profiler = profiler
+        self.stream = ContextStream(profiler)
         self.factory = factory
         self.observation_current = observation_current
         self.model = config.get('gemini_live_model') or 'Gemini Live'
@@ -200,10 +203,15 @@ class LiveSession:
                 await self._send_with_timeout(transport.interrupt(), 'сброс устаревшего наблюдения')
             if self.block_reason or 'ACTIVITY_DURATION' not in self.stream.pending:
                 continue
+            recording = self.profiler.active if self.profiler else None
+            wait_started = clock() if recording else None
+            waiting_for_turn = recording and getattr(transport, 'active', None) is not None
             try:
                 await asyncio.wait_for(transport.wait_ready(), self.response_timeout)
             except asyncio.TimeoutError:
+                self._profile_timeout('previous_turn_timeout')
                 raise LiveProtocolError('Gemini не завершил предыдущий ход до истечения тайм-аута.') from None
+            wait_finished = clock() if recording else None
             while (self.stream.generation == generation and self.stream.pending
                    and not self.interrupted and not self.block_reason):
                 kind, event = self.stream.pending.popitem(last=False)
@@ -215,6 +223,7 @@ class LiveSession:
                     self.sent_at = time.monotonic()
                     self.assessment_due = self.sent_at + self.response_timeout
                     self.analysis_state = 'ANALYZING'
+                dispatched = clock() if recording and kind == 'ACTIVITY_DURATION' else None
                 if not await self._send_with_timeout(self._send_event(transport, event), kind):
                     if self.turn == event.sequence:
                         self.assessment_due = None
@@ -223,14 +232,27 @@ class LiveSession:
                     break
                 self.sent += 1
                 if kind == 'ACTIVITY_DURATION':
+                    if recording and event.recording_id == recording.id:
+                        trace = getattr(transport, 'profile_turn', None)
+                        scope = trace.scope if trace and trace.scope['turn_id'] == event.sequence else recording.scope(event.stamp, event.sequence)
+                        previous = max(0, wait_finished - max(wait_started, event.queued_ns)) if waiting_for_turn else 0
+                        if previous:
+                            recording.submit('latency', 'previous_turn', previous, scope, at=wait_finished)
+                        recording.submit('latency', 'transmission_queue', dispatched - event.queued_ns - previous,
+                                         scope, at=dispatched)
                     if self.stream.pending:
                         wake.set()
                     break
 
     async def _send_event(self, transport, event):
-        if self.block_reason or event.stamp != self.stream.stamp:
-            return False
-        if self.observation_current and not self.observation_current(event.stamp):
+        if (self.block_reason or event.stamp != self.stream.stamp
+                or self.observation_current and not self.observation_current(event.stamp)):
+            recording = self.profiler.active if self.profiler and event.kind == 'SCREEN_FRAME' else None
+            if recording and event.data:
+                frame = event.data.profile
+                scope = recording.scope(event.stamp, frame=frame.frame_id if frame and frame.recording_id == recording.id else None)
+                recording.tally('frames_dropped', scope=scope)
+                recording.tally('frame_stale_before_send', scope=scope)
             return False
         sent_frame = await transport.send(event)
         if sent_frame is not None:
@@ -238,19 +260,30 @@ class LiveSession:
             self.last_frame_sent = time.time()
         return True
 
-    @staticmethod
-    async def _send_with_timeout(operation, stage):
+    def _profile_timeout(self, category):
+        recording = self.profiler.active if self.profiler else None
+        if recording:
+            scope = recording.scope(self.stream.stamp, self.turn)
+            recording.tally('timeouts', scope=scope)
+            recording.tally(category, scope=scope)
+
+    async def _send_with_timeout(self, operation, stage):
         try:
             return await asyncio.wait_for(operation, 5)
         except asyncio.TimeoutError:
+            self._profile_timeout('send_timeout')
             raise LiveProtocolError(f'Истёк тайм-аут отправки ({stage}).') from None
 
-    async def _watch_assessment(self, generation):
+    async def _watch_assessment(self, generation, transport):
         while self.stream.generation == generation:
             await asyncio.sleep(1)
             if self.stream.generation != generation:
                 return
             if self.assessment_due and time.monotonic() >= self.assessment_due:
+                self._profile_timeout('assessment_timeout')
+                trace = getattr(transport, 'profile_turn', None)
+                if trace and trace.scope['turn_id'] == self.turn:
+                    trace.assessment('classifications_failed')
                 raise LiveProtocolError('Gemini не вернул классификацию до истечения тайм-аута.')
 
     async def _receive(self, transport, generation):
@@ -261,11 +294,15 @@ class LiveSession:
             if (self.block_reason or msg.stamp != self.stream.stamp
                     or self.observation_current and not self.observation_current(msg.stamp)):
                 if msg.kind in ('ASSESSMENT', 'COMMENTARY'):
+                    if msg.kind == 'ASSESSMENT' and msg.profile:
+                        msg.profile.assessment('classifications_stale')
                     LOG.debug('Gemini Live discarded %s for an obsolete observation', msg.kind)
                 continue
             if msg.turn == self.turn and msg.kind in ('ASSESSMENT', 'END'):
                 self.last_model_response = time.time()
             if msg.kind == 'END' and msg.turn == self.turn and self.assessed_turn != msg.turn:
+                if msg.profile:
+                    msg.profile.assessment('classifications_failed', category='missing_assessment')
                 self.reset_output()
                 self.analysis_state = 'WAITING_FOR_CONTEXT'
                 self.error = 'Gemini завершил ход без структурированной классификации.'
@@ -277,11 +314,15 @@ class LiveSession:
                     await pending
                 continue
             if self.turn is None or msg.turn != self.turn:
+                if msg.kind == 'ASSESSMENT' and msg.profile:
+                    msg.profile.assessment('classifications_stale')
                 continue
             if msg.kind == 'ASSESSMENT':
                 if getattr(self, 'assessed_turn', None) == msg.turn:
                     continue
                 self.result = Result.parse(msg.data)
+                if msg.profile:
+                    msg.profile.assessment('classifications_ok', at=clock())
                 self.previous_label, self.label = self.label, self.result.classification
                 self.assessed_turn = msg.turn
                 self.assessment_due = None
@@ -319,7 +360,7 @@ class LiveSession:
                 self.assessed_turn = None
                 workers = [asyncio.create_task(self._send(transport, generation, self.wake)),
                            asyncio.create_task(self._receive(transport, generation)),
-                           asyncio.create_task(self._watch_assessment(generation))]
+                           asyncio.create_task(self._watch_assessment(generation, transport))]
                 done, _ = await asyncio.wait(workers, return_when=asyncio.FIRST_COMPLETED)
                 for worker in done:
                     worker.result()
@@ -329,6 +370,17 @@ class LiveSession:
             except Exception as err:
                 if self.stream.generation != generation:
                     return
+                recording = self.profiler.active if self.profiler else None
+                if recording:
+                    category = ('setup_error' if isinstance(err, LiveSetupError) else
+                                'policy_close' if isinstance(err, LivePolicyClose) else
+                                'protocol_error' if isinstance(err, LiveProtocolError) else 'connection_error')
+                    recording.tally(category, scope=recording.scope(self.stream.stamp, self.turn))
+                    if isinstance(err, asyncio.TimeoutError):
+                        self._profile_timeout('connect_timeout')
+                    trace = getattr(transport, 'profile_turn', None)
+                    if trace and trace.sent is not None and trace.scope['turn_id'] == self.turn:
+                        trace.assessment('classifications_failed', category='turn_failed')
                 fatal = isinstance(err, LiveSetupError)
                 diagnostic = live_error(err)
                 if isinstance(err, LivePolicyClose):
@@ -369,6 +421,9 @@ class LiveSession:
                 failures = 0
             failures += 1
             self.reconnects += 1
+            recording = self.profiler.active if self.profiler else None
+            if recording:
+                recording.tally('reconnects', scope=recording.scope(self.stream.stamp))
             await asyncio.sleep(min(30, 2 ** min(5, failures - 1)))
             if defer_until_observation:
                 await self._wait_for_observation(generation)

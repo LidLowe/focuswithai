@@ -253,6 +253,9 @@ class Panel:
         r.add_post('/api/control', self.control)
         r.add_post('/api/process', self.process)
         r.add_get('/api/logs', self.logs)
+        r.add_get('/api/performance', self.performance_status)
+        r.add_post('/api/performance', self.performance_command)
+        r.add_get('/api/performance/export/{format}', self.performance_export)
 
     @web.middleware
     async def _guard(self, request, handler):
@@ -371,6 +374,29 @@ class Panel:
     async def logs(self, request):
         after = int(request.query.get('after', 0))
         return _json({'live': self.rt is not None, 'lines': LOGS.since(after)})
+
+    @_handler
+    async def performance_status(self, request):
+        return _json(self._live().profiler.snapshot())
+
+    @_handler
+    async def performance_command(self, request):
+        runtime = self._live()
+        action = (await self._body(request)).get('action')
+        config = None
+        if runtime.focus:
+            config = {**(runtime.focus.acquisition.settings or {}),
+                      'live_analysis_seconds': runtime.focus.live.session.interval}
+        await asyncio.to_thread(runtime.profiler.control, action, config)
+        return _json(runtime.profiler.snapshot())
+
+    @_handler
+    async def performance_export(self, request):
+        format_ = request.match_info['format']
+        body = await asyncio.to_thread(self._live().profiler.export, format_)
+        return web.Response(text=body, content_type='application/json' if format_ == 'json' else 'text/csv',
+                            charset='utf-8',
+                            headers={'Content-Disposition': f'attachment; filename="focuswithai-performance.{format_}"'})
 
     # --- конфиг ---
 

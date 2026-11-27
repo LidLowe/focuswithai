@@ -3,6 +3,8 @@ from collections import OrderedDict
 from dataclasses import dataclass
 import time
 
+from performance import clock
+
 
 @dataclass(frozen=True)
 class Stamp:
@@ -18,16 +20,21 @@ class ContextEvent:
     stamp: Stamp
     data: object
     sequence: int
+    queued_ns: int | None = None
+    recording_id: str | None = None
 
 
 class ContextStream:
     """At most one pending value per source, including a single latest JPEG."""
-    def __init__(self):
+    def __init__(self, profiler=None):
+        self.profiler = profiler
+        self.pending = OrderedDict()
         self.generation = 0
         self.sequence = 0
         self.clear()
 
     def clear(self):
+        self._discard_frame()
         self.generation += 1
         self.stamp = None
         self.window_key = None
@@ -51,13 +58,27 @@ class ContextStream:
         self.advance()
         self.window_key = self.last_duration = None
         self.latest = {self.sprint_kind: self.latest[self.sprint_kind]}
+        self._discard_frame()
         self.pending.clear()
 
     def event(self, kind, data=None):
         self.sequence += 1
-        return ContextEvent(kind, time.time(), self.stamp, data, self.sequence)
+        recording = self.profiler.active if self.profiler and kind in ('SCREEN_FRAME', 'ACTIVITY_DURATION') else None
+        return ContextEvent(kind, time.time(), self.stamp, data, self.sequence,
+                            clock() if recording else None, recording.id if recording else None)
+
+    def _discard_frame(self, keep=None):
+        recording = self.profiler.active if self.profiler else None
+        event = self.pending.get('SCREEN_FRAME') if recording else None
+        if event and event.data is not None and event.data is not keep:
+            frame = event.data.profile
+            scope = recording.scope(event.stamp, frame=frame.frame_id if frame and frame.recording_id == recording.id else None)
+            recording.tally('frames_dropped', scope=scope)
+            recording.tally('frame_queue_replaced', scope=scope)
 
     def put(self, kind, data, remember=True):
+        if self.profiler and kind == 'SCREEN_FRAME':
+            self._discard_frame(keep=data)
         if remember:
             self.latest[kind] = data
         self.pending[kind] = self.event(kind, data)
@@ -75,6 +96,7 @@ class ContextStream:
         if self.window_key != window_key or self.latest.get('BROWSER_CONTEXT_CHANGED') != values['BROWSER_CONTEXT_CHANGED']:
             self.window_key = window_key
             self.advance()
+            self._discard_frame(keep=frame)
             self.pending.clear()
             self.last_duration = None
             self.put(self.sprint_kind, self.latest[self.sprint_kind])

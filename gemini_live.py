@@ -13,6 +13,7 @@ from activity_protocol import RESPONSE_SCHEMA, Result
 from activity_context import clean
 from commentary import KINDS
 from live_session import LivePolicyClose, LiveProtocolError, LiveSetupError, LiveTransport, Output
+from performance import TurnTrace, clock
 
 
 LOG = logging.getLogger(__name__)
@@ -64,7 +65,7 @@ REPORT_INSTRUCTIONS = (
 
 
 class GeminiLiveTransport(LiveTransport):
-    def __init__(self, config):
+    def __init__(self, config, *, profiler=None):
         validate_preferences(config)
         if config.get('activity_allow_remote') is not True:
             raise LiveSetupError('Разреши отправку текстового контекста в настройках Gemini Live.')
@@ -77,6 +78,8 @@ class GeminiLiveTransport(LiveTransport):
         self.allow_commentary = config.get('live_proactive') is True
         self.allow_images = config.get('activity_send_remote_images') is True
         self.frame = None
+        self.profiler = profiler
+        self.profile_frame = self.profile_turn = self.profile_received_ns = None
         self.current_image_available = False
         self.voice = config.get('gemini_live_voice', DEFAULTS['gemini_live_voice'])
         self.session = self.socket = None
@@ -100,7 +103,7 @@ class GeminiLiveTransport(LiveTransport):
                 raise LiveSetupError(f'Gemini отклонил подключение (HTTP {error.status}). Проверь ключ и доступ к модели.') from None
             raise LiveProtocolError(f'WebSocket handshake отклонён (HTTP {error.status}).') from None
         LOG.info('Gemini Live WebSocket handshake succeeded')
-        await self.socket.send_json({'setup': {
+        await self._send_json({'setup': {
             'model': 'models/' + self.model,
             'generationConfig': {
                 'responseModalities': ['AUDIO'],
@@ -127,6 +130,7 @@ class GeminiLiveTransport(LiveTransport):
         if event.kind == 'SCREEN_FRAME':
             self.frame = event.data if self.allow_images else None
             self.current_image_available = self.frame is not None
+            self.profile_frame = event if self.frame is not None and event.queued_ns is not None else None
             return
         if event.kind != 'ACTIVITY_DURATION':
             self.changes[event.kind] = event.data
@@ -142,6 +146,17 @@ class GeminiLiveTransport(LiveTransport):
         changes, self.changes = self.changes, {}
         context = dict(changes, ACTIVITY_DURATION=event.data)
         self.requested = context.pop('COMMENTARY_REQUEST', None)
+        frame, self.frame = self.frame, None
+        recording = self.profiler.active if self.profiler else None
+        queued = self.profile_frame
+        profiled_frame = getattr(frame, 'profile', None) if queued and queued.stamp == event.stamp else None
+        self.profile_turn = trace = TurnTrace(recording, event, profiled_frame) if recording else None
+        if trace and queued and queued.stamp == event.stamp and queued.recording_id == recording.id:
+            recording.latency('frame_queue', queued.queued_ns, clock(), trace.scope)
+            if profiled_frame and profiled_frame.recording_id == recording.id and 'jpeg' in profiled_frame.timings:
+                recording.latency('jpeg_to_queue', profiled_frame.timings['jpeg'][1], queued.queued_ns, trace.scope)
+        self.profile_frame = None
+        started = clock() if trace else None
         prompt = json.dumps({
             'context_updates': context,
             'observation_id': event.stamp.observation,
@@ -149,20 +164,76 @@ class GeminiLiveTransport(LiveTransport):
             'proactive_commentary_allowed': self.allow_commentary,
             'requested_commentary': self.requested,
         }, ensure_ascii=False)
+        context_ns = clock() - started if trace else 0
         parts = [{'text': prompt}]
-        frame, self.frame = self.frame, None
         if frame is not None:
-            parts.append({'inlineData': {'mimeType': 'image/jpeg',
-                                         'data': base64.b64encode(frame.data).decode('ascii')}})
-        await self.socket.send_json({'clientContent': {
-            'turns': [{'role': 'user', 'parts': parts}], 'turnComplete': True,
-        }})
+            started = clock() if trace else None
+            encoded = base64.b64encode(frame.data).decode('ascii')
+            if trace:
+                recording.latency('base64', started, clock(), trace.scope)
+                recording.tally('base64_bytes', len(encoded), trace.scope)
+            parts.append({'inlineData': {'mimeType': 'image/jpeg', 'data': encoded}})
+        try:
+            await self._send_json({'clientContent': {
+                'turns': [{'role': 'user', 'parts': parts}], 'turnComplete': True,
+            }}, trace=trace, context_ns=context_ns)
+        except (Exception, asyncio.CancelledError):
+            if trace and frame is not None:
+                recording.tally('frames_dropped', scope=trace.scope)
+                recording.tally('frame_send_incomplete', scope=trace.scope)
+            raise
+        if trace and frame is not None:
+            recording.tally('frames_sent', scope=trace.scope)
+            recording.tally('jpeg_sent_bytes', len(frame.data), trace.scope)
         LOG.debug('Gemini Live context sent: %s', ', '.join(context))
         if frame is not None:
             LOG.debug('Gemini Live image sent: %d bytes', len(frame.data))
         return frame
 
+    async def _send_json(self, value, *, trace=None, context_ns=0, reply=False):
+        recording = trace.recording if trace else self.profiler.active if self.profiler else None
+        if not recording or not recording.running:
+            await self.socket.send_json(value)
+            return
+        encoded_bytes = serialized = 0
+
+        def dumps(payload):
+            nonlocal encoded_bytes, serialized
+            begin = clock()
+            text = json.dumps(payload)
+            serialized = clock()
+            encoded_bytes = len(text)  # json.dumps defaults to ASCII escapes.
+            if trace and not reply:
+                recording.submit('latency', 'serialization', serialized - begin + context_ns, trace.scope)
+            return text
+
+        await self.socket.send_json(value, dumps=dumps)
+        completed = clock()
+        scope = trace.scope if trace else recording.scope()
+        recording.tally('ws_out_bytes', encoded_bytes, scope)
+        if trace and reply:
+            trace.tool_reply = completed
+            recording.latency('tool_to_audio', completed, trace.points.get('first_audio'), scope)
+        elif trace:
+            recording.latency('send', serialized, completed, scope)
+            recording.tally('serialized_turn_bytes', encoded_bytes, scope)
+            trace.send_complete(completed)
+
+    def _discard_frame(self):
+        recording = self.profiler.active if self.profiler and self.frame is not None else None
+        if recording:
+            self._frame_dropped(recording, self.frame, 'frame_left_in_transport')
+        self.profile_frame = None
+
+    @staticmethod
+    def _frame_dropped(recording, frame, reason):
+        profile = getattr(frame, 'profile', None)
+        scope = recording.scope(frame=profile.frame_id if profile and profile.recording_id == recording.id else None)
+        recording.tally('frames_dropped', scope=scope)
+        recording.tally(reason, scope=scope)
+
     async def interrupt(self):
+        self._discard_frame()
         self.current_image_available = False
         self.frame = None
         self.changes.clear()
@@ -179,6 +250,8 @@ class GeminiLiveTransport(LiveTransport):
                 raise LiveProtocolError('Gemini прислал GoAway: сервер завершает сессию.')
             if not self.active:
                 continue
+            if self.profile_turn:
+                self.profile_turn.tokens(message.get('usageMetadata'))
             if 'toolCall' in message:
                 LOG.debug('Gemini Live toolCall received')
                 await self._report(message['toolCall'].get('functionCalls', []))
@@ -194,6 +267,8 @@ class GeminiLiveTransport(LiveTransport):
             if idle or (not self.extended and content.get('turnComplete') and content.get('interactionStatus') != 'IN_PROGRESS'):
                 if not self.stale:
                     self._emit('END')
+                if self.profile_turn:
+                    self.profile_turn.finish(final=True)
                 self.active = self.comment = None
                 self.ready.set()
         return self.outputs.popleft()
@@ -205,13 +280,19 @@ class GeminiLiveTransport(LiveTransport):
             if not isinstance(name, str) or not isinstance(call_id, str):
                 raise LiveProtocolError('Некорректный идентификатор toolCall от Gemini.')
             speak = False
+            if name == REPORT and self.stale and self.profile_turn:
+                self.profile_turn.assessment('classifications_stale')
             if name == REPORT and not self.stale and not self.reported:
                 args = call.get('args', {})
                 raw = json.dumps(args.get('assessment'), ensure_ascii=False)
                 try:
                     Result.parse(raw)
                 except (ValueError, TypeError):
+                    if self.profile_turn:
+                        self.profile_turn.assessment('classifications_failed', category='invalid_assessment')
                     raise LiveProtocolError('Gemini вернул классификацию вне схемы.') from None
+                if self.profile_turn:
+                    self.profile_turn.mark('structured_response', clock())
                 self.reported = True
                 self._emit('ASSESSMENT', raw)
                 kind = args.get('commentary_kind')
@@ -232,7 +313,7 @@ class GeminiLiveTransport(LiveTransport):
                 reply['instruction'] = 'Say commentary_text aloud now.'
             responses.append({'name': name, 'id': call_id, 'response': reply})
         if responses:
-            await self.socket.send_json({'toolResponse': {'functionResponses': responses}})
+            await self._send_json({'toolResponse': {'functionResponses': responses}}, trace=self.profile_turn, reply=True)
 
     def _content(self, content):
         if self.stale:
@@ -255,6 +336,8 @@ class GeminiLiveTransport(LiveTransport):
             if not pcm or len(pcm) % 2:
                 raise LiveProtocolError('Gemini прислал пустой или неполный фрагмент PCM16.')
             self.native_audio_bytes += len(pcm)
+            if self.profile_turn and self.profile_received_ns is not None:
+                self.profile_turn.mark('first_audio', self.profile_received_ns)
             LOG.debug('Gemini Live audio received: %d PCM bytes', len(pcm))
             if not self.comment:
                 LOG.debug('Gemini Live ignored PCM without an approved commentary for this turn')
@@ -264,7 +347,7 @@ class GeminiLiveTransport(LiveTransport):
 
     def _emit(self, kind, data=None):
         event = self.active
-        self.outputs.append(Output(kind, event.stamp, event.sequence, data, str(event.sequence)))
+        self.outputs.append(Output(kind, event.stamp, event.sequence, data, str(event.sequence), self.profile_turn))
 
     async def _message(self):
         message = await self.socket.receive()
@@ -275,6 +358,15 @@ class GeminiLiveTransport(LiveTransport):
             if code == 1008:
                 raise self._policy_close(message.extra)
             raise LiveProtocolError(f'WebSocket Gemini закрыт (код {code if code is not None else "не получен"}).')
+        recording = self.profiler.active if self.profiler else None
+        received = clock() if recording else None
+        self.profile_received_ns = received
+        trace = self.profile_turn if self.active else None
+        if recording:
+            data = message.data
+            num_bytes = len(data) if isinstance(data, bytes) or data.isascii() else len(data.encode('utf-8'))
+            scope = trace.scope if trace and trace.recording is recording else recording.scope()
+            recording.tally('ws_in_bytes', num_bytes, scope)
         try:
             value = json.loads(message.data)
         except (ValueError, UnicodeError):
@@ -285,6 +377,8 @@ class GeminiLiveTransport(LiveTransport):
                 raise LiveSetupError(f'Gemini: {status}. Проверь ключ и доступ проекта к модели.')
         if not isinstance(value, dict) or 'error' in value:
             raise LiveProtocolError('Gemini прислал ошибку или неизвестный формат сообщения.')
+        if trace and trace.recording is recording and any(key in value for key in ('serverContent', 'toolCall', 'usageMetadata')):
+            trace.mark('first_response', received)
         return value
 
     def _policy_close(self, detail):
@@ -307,6 +401,10 @@ class GeminiLiveTransport(LiveTransport):
         return LivePolicyClose('Gemini закрыл уже установленную сессию (WebSocket 1008). Точная причина не подтверждена.')
 
     async def close(self):
+        self._discard_frame()
+        if self.profile_turn:
+            self.profile_turn.finish(final=False)
+            self.profile_turn = None
         self.outputs.clear()
         self.changes.clear()
         self.frame = None

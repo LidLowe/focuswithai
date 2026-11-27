@@ -5,7 +5,7 @@ import json
 import ntpath
 import re
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import unquote, urlsplit
 
 from focus_meter import Foreground
@@ -119,6 +119,7 @@ class Frame:
     captured_at: float
     source_key: tuple | None = None
     source_size: tuple[int, int] | None = None
+    profile: object = field(default=None, compare=False, repr=False)
 
     def differs(self, other):
         if other is None or self.source_key != other.source_key:

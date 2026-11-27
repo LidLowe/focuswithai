@@ -18,6 +18,7 @@ from pywintypes import error as WinError
 
 from activity_context import Frame, Privacy, PRIVATE_TEXT, clean
 from focus_windows import foreground
+from performance import clock
 
 
 _affinity = ctypes.windll.user32.GetWindowDisplayAffinity
@@ -51,11 +52,13 @@ def window_automation(hwnd):
         # UI Automation can also run on an existing STA.
         if getattr(error, 'winerror', None) != -2147417850:  # RPC_E_CHANGED_MODE
             raise
+    automation = None
     try:
         api = GetModule('UIAutomationCore.dll')
         automation = CreateObject(api.CUIAutomation, interface=api.IUIAutomation)
         yield automation, automation.ElementFromHandle(hwnd), api
     finally:
+        del automation
         if initialized:
             comtypes.CoUninitialize()
 
@@ -149,7 +152,7 @@ def window_image(hwnd, width, height):
             win32gui.ReleaseDC(hwnd, window_dc)
 
 
-def capture_window(window, dimensions, quality):
+def capture_window(window, dimensions, quality, *, trace=None):
     """Capture the actual foreground HWND using only the Windows graphics API."""
     affinity = wintypes.DWORD()
     if foreground() != window or win32gui.IsIconic(window.handle):
@@ -163,7 +166,11 @@ def capture_window(window, dimensions, quality):
         width, height = right - left, bottom - top
         if min(width, height) < 40 or width * height > 20_000_000:
             return None, 'invalid_dimensions'
+        if trace:
+            trace.started = clock()
         image = window_image(window.handle, width, height)
+        if trace:
+            trace.finish('screenshot', trace.started)
     except (OSError, WinError, win32ui.error):
         return None, 'capture_failed'
     finally:
@@ -175,7 +182,10 @@ def capture_window(window, dimensions, quality):
         return None, 'protected_window'
 
     source_size = image.size
+    started = clock() if trace else None
     image.thumbnail(dimensions)
+    if trace:
+        trace.finish('resize', started)
     if image.width < 40 or image.height < 40:
         return None, 'invalid_dimensions'
     gray = image.convert('L').resize((48, 32))
@@ -183,41 +193,62 @@ def capture_window(window, dimensions, quality):
     if high - low < 8:
         return None, 'blank_frame'
     output = io.BytesIO()
+    started = clock() if trace else None
     image.convert('RGB').save(output, 'JPEG', quality=quality)
+    if trace:
+        trace.finish('jpeg', started)
     return Frame(output.getvalue(), gray.tobytes(), image.width, image.height, time.monotonic(),
-                 source_size=source_size), None
+                 source_size=source_size, profile=trace), None
 
 
-def capture_browser_window(window, dimensions, quality, browser_check):
+def capture_browser_window(window, dimensions, quality, browser_check, *, trace=None):
     """Apply browser privacy checks before accepting an ordinary window screenshot."""
     if foreground() != window:
         return None, 'foreground_changed'
+    started = clock() if trace else None
+    image_ns = 0
     try:
         with window_automation(window.handle) as (automation, root, api):
-            if not root:
+            try:
+                if not root:
+                    return None, 'uia_unavailable'
+                page, reason = browser_page(automation, root, api, browser_check, wake_document=True)
+                if reason:
+                    return None, reason
+                if sensitive_controls(automation, root, api):
+                    return None, 'sensitive_controls'
+
+                if trace:
+                    prior = clock()
+                    try:
+                        frame, reason = capture_window(window, dimensions, quality, trace=trace)
+                    finally:
+                        image_ns = clock() - prior
+                else:
+                    frame, reason = capture_window(window, dimensions, quality)
+                if not frame:
+                    return None, reason
+
+                after, reason = browser_page(automation, root, api, browser_check)
+                if reason:
+                    return None, reason
+                if after != page:
+                    return None, 'browser_changed'
+                if sensitive_controls(automation, root, api):
+                    return None, 'sensitive_controls'
+                if foreground() != window:
+                    return None, 'foreground_changed'
+                return replace(frame, source_key=page), None
+            except (COMError, OSError, ImportError, WinError):
                 return None, 'uia_unavailable'
-            page, reason = browser_page(automation, root, api, browser_check, wake_document=True)
-            if reason:
-                return None, reason
-            if sensitive_controls(automation, root, api):
-                return None, 'sensitive_controls'
-
-            frame, reason = capture_window(window, dimensions, quality)
-            if not frame:
-                return None, reason
-
-            after, reason = browser_page(automation, root, api, browser_check)
-            if reason:
-                return None, reason
-            if after != page:
-                return None, 'browser_changed'
-            if sensitive_controls(automation, root, api):
-                return None, 'sensitive_controls'
-            if foreground() != window:
-                return None, 'foreground_changed'
-            return replace(frame, source_key=page), None
+            finally:
+                # comtypes releases pointers when their Python references are destroyed.
+                del root, automation
     except (COMError, OSError, ImportError, WinError):
         return None, 'uia_unavailable'
+    finally:
+        if trace:
+            trace.finish('browser_verification', started + image_ns)
 
 
 def user_apps():
