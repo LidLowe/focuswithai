@@ -77,9 +77,10 @@ class Frame:
     width: int
     height: int
     captured_at: float
+    source_key: tuple | None = None
 
     def differs(self, other):
-        if other is None:
+        if other is None or self.source_key != other.source_key:
             return True
         pairs = zip(self.fingerprint, other.fingerprint)
         return sum(abs(a - b) >= 12 for a, b in pairs) >= max(1, len(self.fingerprint) // 125)
@@ -108,22 +109,29 @@ class Privacy:
         text = re.sub(r'[._/=?&%#-]+', ' ', unquote(text))
         return bool(PRIVATE_TEXT.search(text) or PRIVATE_BROWSER_TEXT.search(text))
 
-    def browser_capture_allowed(self, address):
-        if not address or any(char.isspace() for char in address):
-            return False
+    def browser_capture_reason(self, address):
+        if not address:
+            return 'url_unavailable' if self.domains else None
+        if any(char.isspace() for char in address):
+            return 'url_unavailable'
         # Chrome hides the scheme in the unfocused address bar.
         try:
             page = urlsplit(address if '://' in address else 'https://' + address)
             domain = (page.hostname or '').rstrip('.')
         except ValueError:
-            return False
+            return 'url_unavailable'
+        if page.scheme not in ('http', 'https') or page.username is not None or page.password is not None:
+            return 'sensitive_page'
         if domain != 'localhost' and not DOMAIN.fullmatch(domain):
             try:
                 ipaddress.ip_address(domain)
             except ValueError:
-                return False
-        return (page.scheme in ('http', 'https') and page.username is None and page.password is None and not self.sensitive_page(address)
-                and (not self.domains or self._matches_domain(domain)))
+                return 'url_unavailable'
+        if self.sensitive_page(address):
+            return 'sensitive_page'
+        if self.domains and not self._matches_domain(domain):
+            return 'domain_excluded'
+        return None
 
     def _matches_domain(self, domain):
         return any(domain == entry or domain.endswith('.' + entry) for entry in self.domains)
@@ -169,6 +177,11 @@ class ContextAggregator:
             self.entered, self.window = now, window
             self.frame = self.frame_checked_at = None
             self.browser = None
+
+    def observation_key(self):
+        browser = (self.browser['domain'], self.browser['title']) if self.browser else None
+        frame_source = self.frame.source_key if self.frame else None
+        return self.window, browser, frame_source
 
     def decision(self, now, result):
         self.decisions.append((now, result.classification.value, round(result.confidence, 2)))

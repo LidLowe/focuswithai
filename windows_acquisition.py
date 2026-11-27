@@ -5,18 +5,30 @@ import io
 import ntpath
 import os
 import time
+from _ctypes import COMError
+from contextlib import contextmanager, suppress
 from ctypes import wintypes
+from hashlib import blake2s
 
 import win32gui
 import win32process
+import win32ui
 from pywintypes import error as WinError
 
-from activity_context import BROWSERS, Frame, PRIVATE_TEXT, clean
-from focus_windows import browser_address, foreground
+from activity_context import BROWSERS, Frame, Privacy, PRIVATE_TEXT, clean
+from focus_windows import foreground
 
 
 _affinity = ctypes.windll.user32.GetWindowDisplayAffinity
 _affinity.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+_print_window = ctypes.windll.user32.PrintWindow
+_print_window.argtypes = (wintypes.HWND, wintypes.HDC, wintypes.UINT)
+_print_window.restype = wintypes.BOOL
+_thread_dpi = ctypes.windll.user32.SetThreadDpiAwarenessContext
+_thread_dpi.argtypes = (ctypes.c_void_p,)
+_thread_dpi.restype = ctypes.c_void_p
+PW_RENDERFULLCONTENT = 2
+PER_MONITOR_AWARE_V2 = -4
 
 
 def set_capture_exclusion(hwnd):
@@ -25,30 +37,118 @@ def set_capture_exclusion(hwnd):
     api(hwnd, 0x11)
 
 
-def sensitive_controls(hwnd):
+@contextmanager
+def window_automation(hwnd):
     import comtypes
-    comtypes.CoInitializeEx(0)
-    try:
-        import comtypes.client
-        import comtypes.gen
+    from comtypes.client import CreateObject, GetModule
 
-        definitions = comtypes.client.GetModule('UIAutomationCore.dll')
-        interfaces = comtypes.gen.UIAutomationClient
-        automation = comtypes.client.CreateObject(interfaces.CUIAutomation, interface=interfaces.IUIAutomation)
-        focused = automation.GetFocusedElement()
-        if not focused or focused.CurrentIsPassword:
-            return True
-        root = automation.ElementFromHandle(hwnd)
-        property_id = definitions.UIA_IsPasswordPropertyId
-        condition = automation.CreatePropertyCondition(property_id, True)
-        return bool(root.FindFirst(4, condition))
+    initialized = False
+    try:
+        comtypes.CoInitializeEx(0)
+        initialized = True
+    except OSError as error:
+        # UI Automation can also run on an existing STA.
+        if getattr(error, 'winerror', None) != -2147417850:  # RPC_E_CHANGED_MODE
+            raise
+    try:
+        api = GetModule('UIAutomationCore.dll')
+        automation = CreateObject(api.CUIAutomation, interface=api.IUIAutomation)
+        yield automation, automation.ElementFromHandle(hwnd), api
     finally:
-        comtypes.CoUninitialize()
+        if initialized:
+            comtypes.CoUninitialize()
+
+
+def sensitive_controls(automation, root, api):
+    focused = automation.GetFocusedElement()
+    if not focused or not root or focused.CurrentIsPassword:
+        return True
+    password = automation.CreatePropertyCondition(api.UIA_IsPasswordPropertyId, True)
+    return bool(root.FindFirst(4, password))
+
+
+def browser_page(automation, root, api, check_address, *, wake_document=False):
+    """Inspect Chromium's own tab/profile controls and renderer, without requiring an omnibox value."""
+    def find(property_id, value):
+        return root.FindFirst(4, automation.CreatePropertyCondition(property_id, value))
+
+    browser = find(api.UIA_ClassNamePropertyId, 'BrowserRootView')
+    avatar = find(api.UIA_ClassNamePropertyId, 'AvatarToolbarButton')
+    if not browser or not avatar or not avatar.CurrentName:
+        return None, 'browser_mode_unverified'
+    if Privacy.sensitive_page(' '.join((browser.CurrentName or '', avatar.CurrentName))):
+        return None, 'private_or_sensitive_window'
+
+    location = find(api.UIA_ClassNamePropertyId, 'LocationIconView')
+    regular_site = ('view site information', 'сведения о сайте', 'информация о сайте')
+    if not location or (location.CurrentName or '').casefold() not in regular_site:
+        return None, 'browser_mode_unverified'
+
+    tab_type = automation.CreatePropertyCondition(api.UIA_ControlTypePropertyId, api.UIA_TabItemControlTypeId)
+    selected = automation.CreatePropertyCondition(api.UIA_SelectionItemIsSelectedPropertyId, True)
+    tab = root.FindFirst(4, automation.CreateAndCondition(tab_type, selected))
+    document = find(api.UIA_ControlTypePropertyId, api.UIA_DocumentControlTypeId)
+    if tab and not document and wake_document:
+        # Chrome initially exposes only its toolbar. Hit-testing can request the
+        # web accessibility tree without changing focus, flags or browser settings.
+        rect = browser.CurrentBoundingRectangle
+        automation.ElementFromPoint(wintypes.POINT((rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2))
+        document = find(api.UIA_ControlTypePropertyId, api.UIA_DocumentControlTypeId)
+    if not tab or not document or document.CurrentIsOffscreen:
+        return None, 'browser_document_unavailable'
+    if Privacy.sensitive_page(' '.join((tab.CurrentName or '', document.CurrentName or ''))):
+        return None, 'sensitive_page'
+
+    address = ''
+    omnibox = find(api.UIA_ClassNamePropertyId, 'OmniboxViewViews')
+    if omnibox and omnibox.CurrentHasKeyboardFocus:
+        return None, 'address_bar_focused'
+    if omnibox and not omnibox.CurrentIsOffscreen:
+        with suppress(COMError):
+            value = omnibox.GetCurrentPropertyValue(api.UIA_ValueValuePropertyId)
+            if isinstance(value, str):
+                address = value
+    reason = check_address(address)
+    if reason:
+        return None, reason
+    identity = blake2s(address.encode(), digest_size=16).digest()
+    return (tuple(tab.GetRuntimeId()), tuple(document.GetRuntimeId()), identity), None
+
+
+def window_image(hwnd, width, height):
+    from PIL import Image
+
+    window_dc = win32gui.GetWindowDC(hwnd)
+    if not window_dc:
+        raise OSError('GetWindowDC failed')
+    bitmap = None
+    try:
+        source = win32ui.CreateDCFromHandle(window_dc)
+        target = source.CreateCompatibleDC()
+        try:
+            bitmap = win32ui.CreateBitmap()
+            bitmap.CreateCompatibleBitmap(source, width, height)
+            target.SelectObject(bitmap)
+            # Capture the window's rendered surface, including accelerated Chrome
+            # content. Reading its window DC directly can return a blank bitmap.
+            if not _print_window(hwnd, target.GetSafeHdc(), PW_RENDERFULLCONTENT):
+                raise OSError('PrintWindow failed')
+            info = bitmap.GetInfo()
+            if info['bmBitsPixel'] != 32:
+                raise OSError('Unsupported window bitmap format')
+            return Image.frombytes('RGB', (width, height), bitmap.GetBitmapBits(True), 'raw',
+                                   'BGRX', info['bmWidthBytes'], 1)
+        finally:
+            target.DeleteDC()
+    finally:
+        try:
+            if bitmap and bitmap.GetHandle():
+                win32gui.DeleteObject(bitmap.GetHandle())
+        finally:
+            win32gui.ReleaseDC(hwnd, window_dc)
 
 
 def capture_window(window, dimensions, quality, browser_check):
-    from PIL import ImageGrab
-
     affinity = wintypes.DWORD()
     if foreground() != window or win32gui.IsIconic(window.handle):
         return None, 'foreground_changed'
@@ -56,21 +156,43 @@ def capture_window(window, dimensions, quality, browser_check):
         return None, 'protected_window'
 
     browser = ntpath.basename(window.executable).casefold() in BROWSERS
-    if browser:
-        address = browser_address(window, for_capture=True)
-        if not browser_check(address):
-            return None, 'browser_unverified'
-    if sensitive_controls(window.handle):
-        return None, 'sensitive_controls'
-    left, top, right, bottom = win32gui.GetWindowRect(window.handle)
-    if not 0 < (right - left) * (bottom - top) <= 20_000_000:
-        return None, 'invalid_dimensions'
-    image = ImageGrab.grab(window=window.handle)
-    if foreground() != window:
-        return None, 'foreground_changed'
-    # Tabs can navigate without changing the native title or window handle.
-    if browser and browser_address(window, for_capture=True) != address:
-        return None, 'browser_changed'
+    try:
+        with window_automation(window.handle) as (automation, root, api):
+            if not root:
+                return None, 'uia_unavailable'
+            page = None
+            if browser:
+                page, reason = browser_page(automation, root, api, browser_check, wake_document=True)
+                if reason:
+                    return None, reason
+            if sensitive_controls(automation, root, api):
+                return None, 'sensitive_controls'
+            previous_dpi = _thread_dpi(PER_MONITOR_AWARE_V2)
+            try:
+                left, top, right, bottom = win32gui.GetWindowRect(window.handle)
+                width, height = right - left, bottom - top
+                if min(width, height) < 40 or width * height > 20_000_000:
+                    return None, 'invalid_dimensions'
+                image = window_image(window.handle, width, height)
+            except (OSError, WinError, win32ui.error):
+                return None, 'capture_failed'
+            finally:
+                if previous_dpi:
+                    _thread_dpi(previous_dpi)
+            if foreground() != window:
+                return None, 'foreground_changed'
+            if _affinity(window.handle, ctypes.byref(affinity)) and affinity.value:
+                return None, 'protected_window'
+            if browser:
+                after, reason = browser_page(automation, root, api, browser_check)
+                if reason:
+                    return None, reason
+                if after != page:
+                    return None, 'browser_changed'
+                if sensitive_controls(automation, root, api):
+                    return None, 'sensitive_controls'
+    except (COMError, OSError, ImportError, WinError):
+        return None, 'uia_unavailable'
     image.thumbnail(dimensions)
     if image.width < 40 or image.height < 40:
         return None, 'invalid_dimensions'
@@ -80,7 +202,7 @@ def capture_window(window, dimensions, quality, browser_check):
         return None, 'blank_frame'
     output = io.BytesIO()
     image.convert('RGB').save(output, 'JPEG', quality=quality)
-    return Frame(output.getvalue(), gray.tobytes(), image.width, image.height, time.monotonic()), None
+    return Frame(output.getvalue(), gray.tobytes(), image.width, image.height, time.monotonic(), page), None
 
 
 def user_apps():

@@ -144,6 +144,7 @@ class GeminiLiveTransport(LiveTransport):
         self.requested = context.pop('COMMENTARY_REQUEST', None)
         prompt = json.dumps({
             'context_updates': context,
+            'observation_id': event.stamp.observation,
             'current_image_available': self.current_image_available,
             'proactive_commentary_allowed': self.allow_commentary,
             'requested_commentary': self.requested,

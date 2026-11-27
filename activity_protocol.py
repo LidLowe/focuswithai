@@ -32,6 +32,8 @@ SYSTEM_PROMPT = (
     'Use the active-window image as the primary evidence when available, supported by the text context. '
     'Reuse a recent image only for the same observation while current_image_available is true. '
     'When there is no usable image, assess permitted text context or return UNCERTAIN. '
+    'A browser executable or duration alone is insufficient to infer the active tab. '
+    'Do not use a screenshot from a previous observation to assess the current foreground. '
     'Use recent activity and duration. Reserve confidence above 0.8 for strong evidence, for example a game '
     'explicitly named in the foreground during unrelated work. Use low confidence if purpose is unclear. '
     'Background applications or music/video alone are not a distraction. Reading, thinking, '

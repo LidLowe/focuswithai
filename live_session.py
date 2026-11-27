@@ -93,7 +93,8 @@ class LiveSession:
         self.sent = self.frames = self.reconnects = 0
         self.last_frame_sent = None
         self.error = self.connected = self.tokens = self.latency = None
-        self.last_success = None
+        self.last_success = self.last_model_response = None
+        self.classifications = 0
         self.reset_output()
 
     def reset_output(self):
@@ -255,6 +256,8 @@ class LiveSession:
                 if msg.kind in ('ASSESSMENT', 'COMMENTARY'):
                     LOG.debug('Gemini Live discarded %s for an obsolete observation', msg.kind)
                 continue
+            if msg.turn == self.turn and msg.kind in ('ASSESSMENT', 'END'):
+                self.last_model_response = time.time()
             if msg.kind == 'END' and msg.turn == self.turn and self.assessed_turn != msg.turn:
                 self.reset_output()
                 self.analysis_state = 'WAITING_FOR_CONTEXT'
@@ -278,6 +281,7 @@ class LiveSession:
                 self.finished_at = max(time.monotonic(), math.nextafter(self.finished_at, math.inf))
                 self.latency = round((self.finished_at - self.sent_at) * 1000)
                 self.last_success = time.time()
+                self.classifications += 1
                 self.analysis_state = 'READY'
                 self.error = None
                 LOG.info('Gemini Live classification received: %s (%d ms)', self.result.classification.value, self.latency)
@@ -381,7 +385,8 @@ class LiveSession:
     def diagnostics(self):
         return dict(model=self.model, connection_state=self.connection_state, analysis_state=self.analysis_state,
                     block_reason=self.block_reason, events=self.sent, frames=self.frames,
-                    last_frame_sent=self.last_frame_sent,
+                    last_frame_sent=self.last_frame_sent, classifications=self.classifications,
+                    last_model_response=self.last_model_response,
                     connected_seconds=int(time.monotonic() - self.connected) if self.connected else 0,
                     latency_ms=self.latency, last_success=self.last_success, reconnects=self.reconnects, tokens=self.tokens, error=self.error,
                     result=vars(self.result) if self.result else None, comment=self.last_comment)

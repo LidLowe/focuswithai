@@ -613,11 +613,18 @@ function captureDiagnostics(st) {
   const skipped = {disabled: 'Автозахват выключен', sprint_inactive: 'Спринт на паузе', idle: 'Мониторинг приостановлен',
     window_excluded: 'Окно исключено или недоступно', foreground_changed: 'Активное окно сменилось',
     protected_window: 'Захват запрещён приложением', sensitive_controls: 'Обнаружено защищённое поле',
-    browser_unverified: 'Безопасность страницы браузера не подтверждена', browser_changed: 'Страница изменилась во время захвата',
+    uia_unavailable: 'Windows UI Automation недоступна',
+    browser_mode_unverified: 'Chrome или Edge не подтвердил обычное окно сайта',
+    private_or_sensitive_window: 'Обнаружено приватное или чувствительное окно',
+    browser_document_unavailable: 'Активная вкладка или её веб-документ недоступны',
+    sensitive_page: 'Обнаружена чувствительная страница', domain_excluded: 'Домен вне списка разрешённых',
+    url_unavailable: 'Адрес не удалось проверить', address_bar_focused: 'Активна адресная строка',
+    browser_changed: 'Вкладка или документ сменились во время захвата',
     invalid_dimensions: 'Недопустимый размер окна', blank_frame: 'Пустой кадр',
     unchanged: 'Кадр не изменился', capture_failed: 'Ошибка захвата'};
   const size = src.last_size;
-  const fields = [['Получено кадров', src.frames_captured], ['Отправлено Gemini', engine?.frames ?? 0],
+  const capture = src.capture_active ? 'Активен' : src.capture_enabled ? 'На паузе' : 'Выключен';
+  const fields = [['Состояние захвата', capture], ['Получено кадров', src.frames_captured], ['Отправлено Gemini', engine?.frames ?? 0],
     ['Размер последнего кадра', size ? `${size.width}×${size.height} · ${size.bytes} байт` : '—'],
     ['Последний захват', time(src.last_capture)], ['Последняя отправка', time(engine?.last_frame_sent)],
     ['Причина пропуска', skipped[src.capture_skip] ?? '—']];
@@ -690,15 +697,18 @@ function liveStatus(st) {
   const live = st?.focus?.live_engine;
   if (!live) return '<p>Статус появится после запуска трекера.</p>';
   if (!live.connection_state) return '<p>Перезапусти FocusWithAI после спринта, чтобы применить обновление.</p>';
+  const responseTime = live.last_model_response ?? live.last_success;
+  const lastResponse = responseTime ? new Date(responseTime * 1000).toLocaleTimeString('ru-RU') : '—';
+  const missingResult = live.result ? '—' : live.error || st.focus.reason || 'Ожидаю оценку Gemini.';
   const fields = [['Соединение', live.connection_state], ['Анализ', live.analysis_state], ['Аудио', live.audio_state],
     ['Модель', live.model], ['Время соединения', fmtMS(live.connected_seconds)],
-    ['События', live.events], ['Кадры', live.frames], ['Задержка, мс', live.latency_ms ?? '—'],
+    ['События', live.events], ['Отправлено кадров', live.frames], ['Получено оценок', live.classifications ?? 0],
+    ['Последний ответ модели', lastResponse], ['Причина отсутствия оценки', missingResult], ['Задержка, мс', live.latency_ms ?? '—'],
     ['Классификация', live.result?.classification || (live.block_reason && st.sprint?.state === 'ACTIVE' ? 'UNCERTAIN' : '—')], ['Комментарий', live.comment || '—'],
     ['Буфер PCM, байт', live.buffer_bytes], ['Прервано при переполнении', live.audio_dropped], ['Переподключения', live.reconnects],
     ['Токены', live.tokens ?? '—'], ['Ошибка', live.error || live.audio_error || '—']];
   const result = live.result;
   return `<div class="activity-grid">${fields.map(([label, value]) => `<div><span class="note">${label}</span><b>${esc(value)}</b></div>`).join('')}</div>
-    ${live.block_reason && st.focus.reason ? `<p class="note">${esc(st.focus.reason)}</p>` : ''}
     ${result ? `<p>${esc(result.observed_activity)} · ${Math.round(result.confidence * 100)}%</p><p>${esc(result.reason)}</p>
     ${st.focus.suggested_next_step ? `<p>Следующий шаг · ${esc(st.focus.suggested_next_step)}</p>` : ''}
     <button class="btn" data-ctl="focus_correct">Отметить ошибку классификации</button>` : ''}`;

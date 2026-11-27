@@ -373,7 +373,7 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
                 acquisition = tracker.acquisition
 
                 def capture(window, dimensions, quality, allow_address):
-                    assert window in (ide, browser) and allow_address('https://docs.example.org/exercise')
+                    assert window in (ide, browser) and allow_address('https://docs.example.org/exercise') is None
                     return Frame(chrome_image, b'fingerprint', 320, 160, time.monotonic()), None
 
                 acquisition.windows = SimpleNamespace(
@@ -419,8 +419,13 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
                         connected_at = session.connected
                         self.assertEqual(session.analysis_state, 'WAITING_FOR_CONTEXT')
                         self.assertEqual(session.sent, 0)
+                        acquisition.context.entered -= 3
+                        tracker._tick(time.monotonic())
+                        await until(lambda: session.result is not None, timeout=session.response_timeout)
+                        self.assertEqual(session.frames, 0)
+                        self.assertEqual(session.connected, connected_at)
                         await check_ide()
-                        for excluded in (browser, private):
+                        for excluded in (protected_tab, private):
                             foreground = excluded
                             tracker.next_sample = 0
                             tracker._tick(time.monotonic())
@@ -440,14 +445,18 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
                             await acquisition.capture_job
                             acquisition.context.entered -= 3
                             tracker.live.allow_images = False
+                            previous = session.last_success
                             tracker._tick(time.monotonic())
-                            self.assertEqual(session.analysis_state, 'WAITING_FOR_CONTEXT')
+                            await until(lambda: session.result and session.last_success != previous,
+                                        timeout=session.response_timeout)
+                            self.assertEqual(session.analysis_state, 'READY')
                             self.assertIsNone(acquisition.context.browser)
                             self.assertEqual(session.frames, 0)
                             self.assertEqual(acquisition.frames_captured, 1)
                             self.assertIn('image_preview', tracker.context_preview(include_image=True))
 
                             previous = session.last_success
+                            acquisition.context.entered -= 3
                             tracker.live.allow_images = True
                             tracker._tick(time.monotonic())
                             await until(lambda: session.result and session.last_success != previous,
@@ -531,7 +540,7 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
                 await self.run_sprint({'activity_allow_remote': True, 'google_assistant_api_key': 'fixture'},
                                       on_complete=verify_close, chrome_image=b'fixture JPEG')
         self.assertEqual(handshakes, 1)
-        self.assertEqual(len(requests), 7)
+        self.assertEqual(len(requests), 9)
         images = [part['inlineData'] for wire in requests for turn in wire['clientContent']['turns']
                   for part in turn['parts'] if 'inlineData' in part]
         self.assertEqual(images, [{'mimeType': 'image/jpeg', 'data': base64.b64encode(b'fixture JPEG').decode()}] * 2)
@@ -541,8 +550,7 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('Excluded application fixture', wire_text)
         self.assertNotIn('secret-example.exe', wire_text)
 
-    @unittest.skipUnless(os.environ.get('FOCUSWITHAI_TEST_GOOGLE') == '1', 'opt-in Google API test')
-    async def test_real_gemini_sprint_and_native_audio(self):
+    def real_config(self):
         from config_store import GEMINI_KEY, read_secret
         path = Path('config.json')
         config = json.loads(path.read_text(encoding='utf-8-sig'))
@@ -550,6 +558,13 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
             config[GEMINI_KEY] = read_secret(path, GEMINI_KEY) or config.get(GEMINI_KEY)
         self.assertTrue(config.get(GEMINI_KEY), 'A saved Gemini API key is required.')
         self.assertTrue(config.get('activity_allow_remote'), 'Text-context permission is required.')
+        # aiohttp may return before Windows has finished closing the TLS transport.
+        self.addAsyncCleanup(asyncio.sleep, .25)
+        return config
+
+    @unittest.skipUnless(os.environ.get('FOCUSWITHAI_TEST_GOOGLE') == '1', 'opt-in Google API test')
+    async def test_real_gemini_sprint_and_native_audio(self):
+        config = self.real_config()
         import io
         from PIL import Image, ImageDraw
         image = Image.new('RGB', (320, 160), 'white')
@@ -560,3 +575,36 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
         await self.run_sprint(config, chrome_image=output.getvalue())
         audio = await probe_gemini_live(config, 'audio')
         self.assertTrue(audio['ok'], audio['stages'])
+
+    @unittest.skipUnless(os.environ.get('FOCUSWITHAI_TEST_GOOGLE') == '1', 'opt-in Google visual-understanding test')
+    async def test_real_gemini_reads_random_number_from_jpeg(self):
+        import io
+        import secrets
+        from PIL import Image, ImageDraw, ImageFont
+
+        config = self.real_config()
+        marker = f'{secrets.randbelow(100_000_000):08d}'
+        image = Image.new('RGB', (800, 300), 'white')
+        drawing = ImageDraw.Draw(image)
+        drawing.text((40, 35), 'CALIBRATION NUMBER', font=ImageFont.load_default(size=36), fill='black')
+        drawing.text((40, 100), marker, font=ImageFont.load_default(size=110), fill='black')
+        output = io.BytesIO()
+        image.save(output, format='JPEG', quality=90)
+        frame = Frame(output.getvalue(), b'', image.width, image.height, time.monotonic())
+
+        config = {**config, 'activity_send_remote_images': True, 'live_proactive': False,
+                  'gemini_live_prompt': 'For this synthetic calibration, put the eight digits you see in the attached '
+                                       'image into observed_activity exactly, using only digits. If no digits are visible, use UNKNOWN.'}
+        session = LiveSession(config, lambda _: None, lambda: None, lambda: GeminiLiveTransport(config))
+        goal = {'goal': 'Read the calibration number from the current image.'}
+        try:
+            session.start('visual-fixture', goal)
+            session.observe({'application': 'synthetic-editor.exe', 'window_title': 'Visual calibration',
+                             'activity_seconds': 3, 'browser': None, 'media': None, 'user_apps': []},
+                            frame, 'visual-fixture', time.monotonic())
+            await until(lambda: session.result is not None or session.error, timeout=60)
+            self.assertIsNotNone(session.result, session.error)
+            self.assertEqual(session.frames, 1)
+            self.assertEqual(session.result.observed_activity, marker)
+        finally:
+            await session.close()

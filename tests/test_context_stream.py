@@ -1,6 +1,8 @@
 import sys
 import time
 import unittest
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from acquisition import Acquisition
@@ -78,35 +80,48 @@ class AcquisitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(source.context.current_frame(now + .1), first)
         self.assertEqual(source.next_capture, now + .1 + 4)
         self.assertEqual(source.capture_skip, 'unchanged')
-        self.assertTrue(source.browser_context_available(now + .1, send_images=True))
-        self.assertFalse(source.browser_context_available(now + .1, send_images=False))
         source.suspend()
 
 
 class ChromeCaptureTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform == 'win32', 'uses the Windows accessibility adapter')
-    def test_chrome_address_is_unavailable_for_incognito_and_unknown_window_names(self):
-        from focus_windows import browser_address
+    def test_chrome_without_url_uses_verified_tab_and_privacy_controls(self):
+        from activity_context import Privacy
+        from windows_acquisition import browser_page
 
-        chrome = Foreground(5, 6, 'Work fixture - Google Chrome', r'C:\Chrome\chrome.exe')
-        root = Mock(control_type='Window')
-        address = Mock(control_type='Edit', automation_id='addressEditBox')
-        address.element.CurrentIsOffscreen = False
-        address.element.CurrentHasKeyboardFocus = False
-        root.children.return_value = [address]
-        with (patch('focus_windows.foreground', return_value=chrome),
-              patch('comtypes.CoInitializeEx'), patch('comtypes.CoUninitialize'),
-              patch('pywinauto.uia_element_info.UIAElementInfo', return_value=root),
-              patch('pywinauto.controls.uiawrapper.UIAWrapper') as wrapper):
-            wrapper.return_value.iface_value.CurrentValue = 'docs.example.org/work'
-            for title in ('', chrome.title + ' (Incognito)', chrome.title + ' (Инкогнито)'):
-                root.name = title
-                self.assertEqual(browser_address(chrome, for_capture=True), '')
-            wrapper.assert_not_called()
-            root.name = chrome.title
-            self.assertEqual(browser_address(chrome, for_capture=True), 'docs.example.org/work')
-            address.element.CurrentHasKeyboardFocus = True
-            self.assertEqual(browser_address(chrome, for_capture=True), '')
+        api = SimpleNamespace(UIA_ClassNamePropertyId=1, UIA_ControlTypePropertyId=2,
+                              UIA_SelectionItemIsSelectedPropertyId=3, UIA_TabItemControlTypeId=4,
+                              UIA_DocumentControlTypeId=5, UIA_ValueValuePropertyId=6)
+        browser = Mock(CurrentName='Work fixture', GetRuntimeId=Mock(return_value=[1]))
+        avatar = Mock(CurrentName='You')
+        tab = Mock(CurrentName='Work fixture', GetRuntimeId=Mock(return_value=[2]))
+        document = Mock(CurrentName='Work fixture', CurrentIsOffscreen=False,
+                        GetRuntimeId=Mock(return_value=[3]))
+        nodes = {(1, 'BrowserRootView'): browser, (1, 'AvatarToolbarButton'): avatar,
+                 (1, 'LocationIconView'): Mock(CurrentName='View site information'),
+                 ((2, 4), (3, True)): tab, (2, 5): document}
+        automation = Mock(CreatePropertyCondition=lambda *args: args,
+                          CreateAndCondition=lambda *args: args)
+        root = Mock(FindFirst=lambda _, key: nodes.get(key))
+        privacy = Privacy({})
+
+        def probe(context=privacy):
+            return browser_page(automation, root, api, context.browser_capture_reason)
+
+        first, reason = probe()
+        self.assertIsNone(reason)
+        self.assertIsNotNone(first)
+        self.assertEqual(probe(Privacy({'browser_context_domains': ['example.org']}))[1], 'url_unavailable')
+        tab.GetRuntimeId.return_value = [4]
+        self.assertNotEqual(probe()[0], first)
+        avatar.CurrentName = 'Incognito'
+        self.assertEqual(probe(), (None, 'private_or_sensitive_window'))
+        avatar.CurrentName = 'You'
+        document.CurrentName = 'Sign in'
+        self.assertEqual(probe(), (None, 'sensitive_page'))
+        document.CurrentName = 'Work fixture'
+        nodes.pop((2, 5))
+        self.assertEqual(probe(), (None, 'browser_document_unavailable'))
 
     @unittest.skipUnless(sys.platform == 'win32', 'uses the Windows capture adapter')
     def test_browser_capture_checks_privacy_before_and_after_the_image(self):
@@ -115,39 +130,67 @@ class ChromeCaptureTests(unittest.TestCase):
         from windows_acquisition import capture_window
 
         chrome = Foreground(5, 6, 'Work fixture - Google Chrome', r'C:\Chrome\chrome.exe')
-        privacy = Privacy({'browser_context_domains': ['docs.example.org']})
+        privacy = Privacy({})
         image = Image.new('RGB', (80, 80), 'white')
         image.paste((0, 0, 0), (0, 0, 40, 40))
-        safe = 'https://docs.example.org/reference'
-        login = 'https://docs.example.org/login'
+        safe = ((1,), (2,))
 
         with (patch('windows_acquisition.foreground', return_value=chrome),
               patch('windows_acquisition.win32gui.IsIconic', return_value=False),
               patch('windows_acquisition.win32gui.GetWindowRect', return_value=(0, 0, 80, 80)),
               patch('windows_acquisition._affinity', return_value=False),
+              patch('windows_acquisition.window_automation', return_value=nullcontext((Mock(), Mock(), Mock()))),
               patch('windows_acquisition.sensitive_controls', return_value=False) as sensitive,
-              patch('windows_acquisition.browser_address') as read_address,
-              patch('PIL.ImageGrab.grab', return_value=image) as grab):
-            for address in ('', login):
-                read_address.return_value = address
-                self.assertIsNone(capture_window(chrome, (80, 80), 72, privacy.browser_capture_allowed)[0])
+              patch('windows_acquisition.browser_page') as read_page,
+              patch('windows_acquisition.window_image', return_value=image) as grab):
+            def capture():
+                return capture_window(chrome, (80, 80), 72, privacy.browser_capture_reason)
+
+            for reason in ('browser_mode_unverified', 'sensitive_page'):
+                read_page.return_value = None, reason
+                self.assertEqual(capture(), (None, reason))
                 grab.assert_not_called()
 
-            read_address.side_effect = [safe, login]
-            self.assertIsNone(capture_window(chrome, (80, 80), 72, privacy.browser_capture_allowed)[0])
-            grab.assert_called_once_with(window=chrome.handle)
+            read_page.side_effect = [(safe, None), (None, 'sensitive_page')]
+            self.assertEqual(capture(), (None, 'sensitive_page'))
+            grab.assert_called_once_with(chrome.handle, 80, 80)
             grab.reset_mock()
 
-            read_address.side_effect = [safe, safe]
-            frame, reason = capture_window(chrome, (80, 80), 72, privacy.browser_capture_allowed)
+            read_page.side_effect = [(safe, None), (((3,), (4,)), None)]
+            self.assertEqual(capture(), (None, 'browser_changed'))
+            grab.reset_mock()
+
+            read_page.side_effect = [(safe, None), (safe, None)]
+            frame, reason = capture()
+            self.assertIsNone(reason)
             self.assertTrue(frame.data.startswith(b'\xff\xd8'))
-            grab.assert_called_once_with(window=chrome.handle)
+            self.assertEqual(frame.source_key, safe)
+            grab.assert_called_once_with(chrome.handle, 80, 80)
 
             grab.reset_mock()
             sensitive.return_value = True
-            read_address.side_effect = None
-            read_address.return_value = safe
-            self.assertIsNone(capture_window(chrome, (80, 80), 72, privacy.browser_capture_allowed)[0])
+            read_page.side_effect = None
+            read_page.return_value = safe, None
+            self.assertEqual(capture(), (None, 'sensitive_controls'))
+            grab.assert_not_called()
+
+            sensitive.return_value = False
+            grab.side_effect = OSError
+            self.assertEqual(capture(), (None, 'capture_failed'))
+
+    @unittest.skipUnless(sys.platform == 'win32', 'uses the Windows capture adapter')
+    def test_unavailable_uia_skips_image_before_capture(self):
+        from activity_context import Privacy
+        from windows_acquisition import capture_window
+
+        chrome = Foreground(5, 6, 'Work fixture - Google Chrome', r'C:\Chrome\chrome.exe')
+        with (patch('windows_acquisition.foreground', return_value=chrome),
+              patch('windows_acquisition.win32gui.IsIconic', return_value=False),
+              patch('windows_acquisition._affinity', return_value=False),
+              patch('windows_acquisition.window_automation', side_effect=OSError),
+              patch('windows_acquisition.window_image') as grab):
+            self.assertEqual(capture_window(chrome, (80, 80), 72, Privacy({}).browser_capture_reason),
+                             (None, 'uia_unavailable'))
             grab.assert_not_called()
 
 
@@ -184,6 +227,20 @@ class StreamTests(unittest.TestCase):
         self.assertFalse(stream.pending)
         self.assertNotIn('SCREEN_FRAME', stream.latest)
         self.assertNotEqual(stream.stamp, stamp)
+
+    def test_same_title_browser_tab_replaces_pending_image_and_invalidates_the_previous_result(self):
+        stream = ContextStream()
+        stream.start('sprint', {})
+        chrome = {**facts(''), 'application': 'chrome.exe'}
+        first = Frame(b'old', b'pixels', 2, 2, 20, ('document-1',))
+        second = Frame(b'new', b'pixels', 2, 2, 21, ('document-2',))
+        self.assertTrue(second.differs(first))
+        stream.observe(chrome, first, ('chrome-window', first.source_key), 20, 8)
+        old_stamp = stream.stamp
+        stream.observe(chrome, second, ('chrome-window', second.source_key), 21, 8)
+        self.assertNotEqual(stream.stamp, old_stamp)
+        self.assertIs(stream.pending['SCREEN_FRAME'].data, second)
+        self.assertEqual(stream.pending['ACTIVITY_DURATION'].stamp, stream.stamp)
 
     def test_recent_switches_and_warnings_travel_before_the_analysis(self):
         stream = ContextStream()

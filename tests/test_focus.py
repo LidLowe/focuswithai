@@ -54,6 +54,7 @@ class FocusContextTests(unittest.IsolatedAsyncioTestCase):
                                   notifier=VoicePackNotifier(config), sound_enabled=lambda: True,
                                   get_window=lambda: browser, transport_factory=transport)
         tracker.monitor.get_idle = lambda: 0
+        tracker.acquisition.windows = SimpleNamespace(foreground=lambda: browser, user_apps=lambda: [])
         try:
             tracker._tick(now)
             tracker._tick(now + 3)
@@ -61,7 +62,9 @@ class FocusContextTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(tracker.meter.score, 0)
             await until(lambda: tracker.live.session.connection_state == 'CONNECTED')
             transport.assert_called_once_with()
-            self.assertEqual(tracker.live.session.sent, 0)
+            await until(lambda: tracker.live.session.result is not None)
+            self.assertGreater(tracker.live.session.sent, 0)
+            self.assertEqual(tracker.live.session.result.classification, 'UNCERTAIN')
         finally:
             await tracker.live.session.close()
             if tracker.hud:

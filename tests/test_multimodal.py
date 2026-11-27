@@ -36,17 +36,19 @@ class ObservationTests(unittest.TestCase):
 
     def test_chrome_address_privacy_works_without_extension(self):
         privacy = Privacy({})
-        self.assertTrue(privacy.browser_capture_allowed('docs.example.org/reference'))
-        self.assertTrue(privacy.browser_capture_allowed('http://localhost:3000/work'))
-        for address in ('', 'chrome://settings', 'file:///C:/example.html', 'https://user@example.org/',
+        self.assertIsNone(privacy.browser_capture_reason('docs.example.org/reference'))
+        self.assertIsNone(privacy.browser_capture_reason('http://localhost:3000/work'))
+        for address in ('chrome://settings', 'file:///C:/example.html', 'https://user@example.org/',
                         'https://example.org/oauth/start', 'https://example.org/sign%2Din',
                         'https://our-bank.example.org/', 'https://example.org/?access_token=fixture',
                         'https://example.org/checkout'):
             with self.subTest(address=address):
-                self.assertFalse(privacy.browser_capture_allowed(address))
+                self.assertIsNotNone(privacy.browser_capture_reason(address))
         scoped = Privacy({'browser_context_domains': ['docs.example.org']})
-        self.assertTrue(scoped.browser_capture_allowed('https://api.docs.example.org/reference'))
-        self.assertFalse(scoped.browser_capture_allowed('https://notdocs.example.org/reference'))
+        self.assertIsNone(scoped.browser_capture_reason('https://api.docs.example.org/reference'))
+        self.assertIsNone(privacy.browser_capture_reason(''))
+        self.assertEqual(scoped.browser_capture_reason(''), 'url_unavailable')
+        self.assertIsNotNone(scoped.browser_capture_reason('https://notdocs.example.org/reference'))
 
     def test_rolling_history_sanitization_and_image_deduplication(self):
         context = ContextAggregator(Privacy({}))

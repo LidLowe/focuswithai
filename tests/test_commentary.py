@@ -56,9 +56,9 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
         notifier.alarms.play_event = alarm
         phase = SimpleNamespace(key=('abc', 0), active=True, sprint={'id': 'abc', 'state': 'ACTIVE'}, context=json.dumps({'goal': 'Synthetic exercise'}))
         win = Foreground(1, 2, '[demo] unrelated game', 'demo.exe')
-        signature = (phase.context, win, None)
+        signature = (phase.context, win, None, None)
         owner = SimpleNamespace(phase=lambda: phase, phase_key=phase.key, signature=signature,
-            use_ai=lambda: True, acquisition=SimpleNamespace(context=SimpleNamespace(window=win, browser=None),
+            use_ai=lambda: True, acquisition=SimpleNamespace(context=SimpleNamespace(observation_key=lambda: (win, None, None)),
             foreground_is_current=lambda: True), decision=DecisionEngine(cfg), intervention=None, on_intervention=Mock())
         live = LiveFocus(cfg, owner, notifier, lambda: True, transport_factory=MockLiveTransport)
         self.addAsyncCleanup(live.audio.close)

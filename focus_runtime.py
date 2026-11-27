@@ -231,24 +231,19 @@ class FocusController:
             self.was_private = private
             self.acquisition.sample(now, window, idle=idle or not self.use_ai())
             context = self.acquisition.context
-            signature = (phase.context, window, (context.browser['domain'], context.browser['title']) if context.browser else None)
+            signature = (phase.context, *context.observation_key())
             if signature != self.signature:
                 new_context = self.signature is None or self.signature[0] != phase.context
                 self.decision.reset(keep_correction=not new_context)
                 self.signature = signature
             self.next_action = None
-            browser = ntpath.basename(window.executable).casefold() in BROWSERS
             blocked = None
             if not self.use_ai():
                 blocked = ('analysis_disabled', 'Анализ приостановлен.')
             elif private:
                 blocked = ('excluded_window', 'Окно исключено из анализа.')
-            elif browser and not self.acquisition.browser_context_available(now, send_images=self.live.allow_images):
-                blocked = ('browser_context_unavailable', 'Ожидаю разрешённый кадр Chrome или данные рабочей вкладки.')
             elif idle:
                 blocked = ('idle', 'Давно не было мыши или клавиатуры.')
-            elif not window.executable and not window.title:
-                blocked = ('missing_window', 'Не удалось определить активное окно.')
             elif now - context.entered < 2 or not self.acquisition.foreground_is_current():
                 blocked = ('window_settling', 'Ожидаю актуальный контекст окна.')
             if blocked:

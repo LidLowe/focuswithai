@@ -179,10 +179,7 @@ class Acquisition:
         self.job_epoch = self.capture_epoch
         self.next_capture = now + min(120, self.interval * self.capture_backoff)
         self.capture_job = background(self.windows.capture_window, window, self.dimensions, self.quality,
-                                      self.privacy.browser_capture_allowed)
-
-    def browser_context_available(self, now, *, send_images):
-        return bool(self.context.browser or (send_images and self.capture_sprint and self.context.current_frame(now)))
+                                      self.privacy.browser_capture_reason)
 
     def foreground_is_current(self):
         return not self.windows or self.windows.foreground() == self.context.window

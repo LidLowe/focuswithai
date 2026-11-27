@@ -57,8 +57,7 @@ class LiveFocus:
     def current(self, stamp):
         phase = self.owner.phase()
         acq = self.owner.acquisition
-        browser = acq.context.browser
-        signature = (phase.context, acq.context.window, (browser['domain'], browser['title']) if browser else None)
+        signature = (phase.context, *acq.context.observation_key())
         return (phase.active and not self.session.block_reason and self.owner.use_ai() and self.owner.phase_key == phase.key
                 and stamp == self.session.stream.stamp and signature == self.owner.signature
                 and signature == self.session.stream.window_key
