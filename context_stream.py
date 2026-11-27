@@ -63,6 +63,7 @@ class ContextStream:
         if changed or self.window_key != window_key:
             self.window_key = window_key
             self.stamp = Stamp(self.stamp.sprint_id, self.generation, self.stamp.observation + 1)
+            self.pending.pop('RECENT_ACTIVITY', None)
             if self.pending.pop('ACTIVITY_DURATION', None):
                 self.last_duration = None
             for kind, data in changed.items():
@@ -70,6 +71,11 @@ class ContextStream:
         if self.last_duration is None or now - self.last_duration >= interval:
             self.last_duration = now
             self.put('ACTIVITY_DURATION', facts['activity_seconds'])
+            self.put('RECENT_ACTIVITY', {
+                key: facts[key] for key in ('recent_switches', 'recent_classifications', 'distraction_score', 'recent_warnings')
+                if key in facts
+            }, remember=False)
+            self.pending.move_to_end('ACTIVITY_DURATION')
         return bool(self.pending)
 
     def replay(self):
@@ -86,4 +92,3 @@ class ContextStream:
         if frame:
             data['SCREEN_FRAME'] = {'width': frame.width, 'height': frame.height, 'bytes': len(frame.data)}
         return data
-

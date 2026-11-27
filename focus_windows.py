@@ -16,7 +16,7 @@ from focus_meter import Foreground
 BROWSERS = {'chrome.exe', 'msedge.exe'}
 PROTECTED_EXES = BROWSERS | {
     'firefox.exe', 'brave.exe', 'opera.exe', 'vivaldi.exe', 'python.exe', 'pythonw.exe',
-    'llama-server.exe', 'explorer.exe', 'taskmgr.exe', 'dwm.exe', 'winlogon.exe',
+    'explorer.exe', 'taskmgr.exe', 'dwm.exe', 'winlogon.exe',
     'windowsterminal.exe', 'cmd.exe', 'powershell.exe', 'pwsh.exe',
     'searchhost.exe', 'shellexperiencehost.exe', 'startmenuexperiencehost.exe',
     'systemsettings.exe', 'applicationframehost.exe', 'securityhealthsystray.exe',

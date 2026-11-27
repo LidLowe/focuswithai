@@ -46,18 +46,32 @@ class StreamTests(unittest.TestCase):
         for i in range(100):
             frame = Frame(bytes([i]), bytes([i]), 2, 2, i)
             stream.observe(facts(), frame, 'window', 20, 10)
-        self.assertLessEqual(len(stream.pending), 6)
+        self.assertLessEqual(len(stream.pending), 7)
         self.assertIs(stream.pending['SCREEN_FRAME'].data, frame)
         self.assertEqual(stream.pending['ACTIVITY_DURATION'].stamp, stream.stamp)
         stream.pending.clear()
         stream.observe(facts(), frame, 'window', 25, 10)
         self.assertFalse(stream.pending)
         stream.observe(facts(), frame, 'window', 30, 10)
-        self.assertEqual(list(stream.pending), ['ACTIVITY_DURATION'])
+        self.assertEqual(list(stream.pending), ['RECENT_ACTIVITY', 'ACTIVITY_DURATION'])
         stream.replay()
         self.assertIn('SPRINT_STARTED', stream.pending)
         self.assertEqual(stream.preview()['SCREEN_FRAME']['bytes'], 1)
         self.assertNotIn(frame.data, stream.preview().values())
+
+    def test_recent_switches_and_warnings_travel_before_the_analysis(self):
+        stream = ContextStream()
+        stream.start('sprint', {})
+        facts_with_history = {**facts(), 'recent_switches': [{'app': 'editor.exe', 'seconds': 9}],
+                              'recent_warnings': [{'kind': 'DEVIATION', 'seconds_ago': 24}]}
+        stream.observe(facts_with_history, None, 'window', 20, 8)
+        recent, turn = list(stream.pending.values())[-2:]
+        self.assertEqual(recent.kind, 'RECENT_ACTIVITY')
+        self.assertEqual(turn.kind, 'ACTIVITY_DURATION')
+        self.assertEqual(recent.stamp, turn.stamp)
+        self.assertEqual(recent.data['recent_warnings'], facts_with_history['recent_warnings'])
+        stream.replay()
+        self.assertNotIn('RECENT_ACTIVITY', stream.pending)
 
     def test_activity_and_generation_invalidation(self):
         stream = ContextStream()
@@ -72,4 +86,3 @@ class StreamTests(unittest.TestCase):
         stream.clear()
         self.assertIsNone(stream.stamp)
         self.assertFalse(stream.preview())
-

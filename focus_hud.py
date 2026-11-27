@@ -234,15 +234,13 @@ class FocusHUD:
                     timer = f'{seconds // 60:02d}:{seconds % 60:02d}'
             show_meter = self.show_distraction and state['meter_enabled'] and bool(sprint)
             activity = ACTIVITY.get(state['activity'], '')
-            result = state['ai']['current']
+            live = state['live_engine']
+            result = live['result']
             if result and result['classification'] == 'INDIRECTLY_RELATED' and state['activity'] == 'ON_TASK':
                 activity = 'Связано с целью'
-            ai = state['ai']
-            health = {'ready': 'AI готов', 'analyzing': 'AI анализирует', 'unavailable': 'AI недоступен',
-                      'rate_limited': 'Лимит AI', 'disabled': 'AI выключен'}.get(ai['status'], 'AI ожидает')
-            if state.get('live_engine'):
-                health = 'Live · ' + state['live_engine']['state']
-            stamp = time.strftime('%H:%M:%S', time.localtime(ai['last_success'])) if ai['last_success'] else ''
+            health = 'Gemini · ' + live['state']
+            last_success = live['last_success']
+            stamp = time.strftime('%H:%M:%S', time.localtime(last_success)) if last_success else ''
             footer = 'Захват окна · Ctrl+Shift+F9' if recording else ' '.join(filter(None, (health, stamp)))
             content = (state['score'], state['level'], label, activity,
                        state['task'] if self.show_task else '', timer, show_meter, footer, recording)

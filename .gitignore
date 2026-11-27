@@ -4,6 +4,7 @@ speaktest.py
 __pycache__
 run.bat
 config.json
+config.pre-gemini-live.json
 sessions.jsonl
 session_stats.json
 sprints.json

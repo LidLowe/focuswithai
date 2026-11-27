@@ -15,7 +15,7 @@ os.environ.setdefault('SDL_AUDIODRIVER', 'dummy')
 os.environ.setdefault('PYGAME_HIDE_SUPPORT_PROMPT', '1')
 
 from audio_import import MpqSource, STORM_DLL, import_starcraft, save_clip
-from voicepack import Activity, ClipPlayer, Event, PlaybackStopped, VoicePackCatalog, VoicePackNotifier
+from voicepack import ClipPlayer, Event, PlaybackStopped, VoicePackCatalog, VoicePackNotifier
 
 
 def clip_bytes(value=1000, frames=800):
@@ -27,9 +27,8 @@ def clip_bytes(value=1000, frames=800):
 
 
 class AudioRoutingTests(unittest.IsolatedAsyncioTestCase):
-    async def test_five_modes_keep_order_and_the_default_delay(self):
-        expected = {'alarm': ['alarm'], 'voicepack': ['voice'], 'tts': ['tts'],
-                    'alarm_voicepack': ['alarm', 'voice'], 'alarm_tts': ['alarm', 'tts']}
+    async def test_pack_modes_keep_order_and_the_default_delay(self):
+        expected = {'alarm': ['alarm'], 'voicepack': ['voice'], 'alarm_voicepack': ['alarm', 'voice']}
         for mode, order in expected.items():
             with self.subTest(mode=mode):
                 calls = []
@@ -40,16 +39,12 @@ class AudioRoutingTests(unittest.IsolatedAsyncioTestCase):
                         return True
                     return record
 
-                speech = AsyncMock()
-                speech.synthesize.return_value = clip_bytes(), 'wav'
                 router = VoicePackNotifier({'notification_mode': mode, 'alarm_volume': 0.2,
                     'voicepack_volume': 0.6, 'alarm_pack_id': 'demo', 'voicepack_id': 'terran',
-                    'audio_event_mappings': {'alarm': {'demo': {'TASK_COMPLETED': 'attention/ping.wav'}}}},
-                    AsyncMock(), speech)
+                    'audio_event_mappings': {'alarm': {'demo': {'TASK_COMPLETED': 'attention/ping.wav'}}}})
                 router.alarms.play_event = AsyncMock(side_effect=marker('alarm'))
                 router.engine.play_event = AsyncMock(side_effect=marker('voice'))
-                router.player.play = AsyncMock(side_effect=marker('tts'))
-                self.assertTrue(router.notify(Event.TASK_COMPLETED, {'observation': 'Готово'}, use_ai=False))
+                self.assertTrue(router.notify(Event.TASK_COMPLETED))
                 await router._task
                 self.assertEqual([kind for kind, _ in calls], order)
                 if order[0] == 'alarm':
@@ -57,14 +52,11 @@ class AudioRoutingTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(router.alarms.play_event.await_args.args[4], 'attention/ping.wav')
                 if order[-1] == 'voice':
                     self.assertEqual(router.engine.play_event.await_args.args[2], 0.6)
-                if mode in ('alarm_voicepack', 'alarm_tts'):
+                if mode == 'alarm_voicepack':
                     self.assertGreaterEqual(calls[1][1] - calls[0][1], 0.28)
-                if 'tts' not in order:
-                    speech.synthesize.assert_not_awaited()
 
     async def test_stop_during_delay_cancels_the_voice_stage(self):
-        router = VoicePackNotifier({'notification_mode':'alarm_voicepack', 'alarm_voice_delay_ms': 5000},
-                                   AsyncMock(), AsyncMock())
+        router = VoicePackNotifier({'notification_mode':'alarm_voicepack', 'alarm_voice_delay_ms': 5000})
         started = asyncio.Event()
 
         async def effect(*_args):
@@ -73,7 +65,7 @@ class AudioRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         router.alarms.play_event = AsyncMock(side_effect=effect)
         router.engine.play_event = AsyncMock(return_value=True)
-        router.notify(Event.ATTENTION, {'observation': 'Внимание'}, use_ai=False)
+        router.notify(Event.ATTENTION)
         task = router._task
         await asyncio.wait_for(started.wait(), 1)
         router.stop_audio()
@@ -94,21 +86,10 @@ class AudioRoutingTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(PlaybackStopped):
             await second
 
-    async def test_disabled_event_skips_the_model_and_audio(self):
-        model = AsyncMock()
-        router = VoicePackNotifier({'notification_mode': 'alarm', 'notification_disabled_events': ['ATTENTION']},
-                                   model, AsyncMock())
-        self.assertFalse(router.notify(Event.ATTENTION, {'observation': 'Внимание'}))
-        model.chat.assert_not_awaited()
-
-    def test_long_distraction_has_a_finite_repeat_budget(self):
-        activity = Activity({'reminder_interval': 1, 'punishment_interval': 2,
-                             'voicepack_repeat_interval': 5, 'voicepack_max_repeats': 1})
-        activity.observe(0, False, None)
-        self.assertEqual(activity.observe(1, False, None)[0], Event.DISTRACTION)
-        self.assertEqual(activity.observe(2, False, None)[0], Event.PERSISTENT_DISTRACTION)
-        self.assertEqual(activity.observe(7, False, None)[0], Event.PERSISTENT_DISTRACTION)
-        self.assertIsNone(activity.observe(100, False, None))
+    async def test_disabled_event_skips_audio(self):
+        router = VoicePackNotifier({'notification_mode': 'alarm', 'notification_disabled_events': ['ATTENTION']})
+        self.assertFalse(router.notify(Event.ATTENTION))
+        self.assertIsNone(router._task)
 
 
 class ImportTests(unittest.TestCase):

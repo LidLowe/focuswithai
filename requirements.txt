@@ -1,9 +1,7 @@
-pygetwindow==0.0.9
-pywinauto==0.6.8
-pygame==2.6.1
-edge-tts>=7.3.1
 aiohttp>=3.9
+pygame==2.6.1
 discord-rpc==5.1
-piper-tts>=1.8.0
+pywinauto==0.6.8; sys_platform == "win32"
+pywin32>=308; sys_platform == "win32"
 Pillow>=11.2.1; sys_platform == "win32"
 winrt-Windows.Media.Control>=3; sys_platform == "win32"

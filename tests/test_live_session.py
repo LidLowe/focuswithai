@@ -2,7 +2,8 @@ import asyncio
 import unittest
 from unittest.mock import Mock
 
-from live_session import LiveSession, MockLiveTransport, Output
+from live_session import LiveSession, Output
+from mock_live import MockLiveTransport
 from test_context_stream import facts
 
 
@@ -82,7 +83,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(choices[0].closed)
 
     async def test_correction_interrupts_and_clears_accepted_response(self):
-        session = LiveSession({}, Mock(), Mock())
+        session = LiveSession({}, Mock(), Mock(), MockLiveTransport)
         self.addAsyncCleanup(session.close)
         session.start('one', facts()['sprint'])
         session.observe(facts(), None, 1, 1)
@@ -91,4 +92,3 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(session.command('USER_CORRECTION', 'incorrect'))
         self.assertNotEqual(stamp, session.stream.stamp)
         self.assertIsNone(session.result)
-

@@ -3,9 +3,11 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
-from focus_meter import ActivityState, Foreground, LLMClassifier
+from activity_context import ContextAggregator, Privacy
+from context_stream import ContextStream
+from focus_meter import ActivityState, Foreground
 from sprints import SprintManager
 
 
@@ -111,25 +113,17 @@ class SprintTests(unittest.TestCase):
         self.assertEqual(len(self.store.snapshot()['sprints']), 1)
 
 
-class SprintClassifierTests(unittest.IsolatedAsyncioTestCase):
-    async def test_goal_context_and_uncertainty(self):
-        mock = AsyncMock()
-        mock.chat.return_value = '{"state":"OFF_TASK","reason":"Цель про VLAN"}'
-        classifier = LLMClassifier(mock, {})
-        now = time.monotonic()
-        sprint = json.dumps({'goal': 'Learn VLANs', 'description': 'Network lab', 'subtasks': ['Read docs']})
-        window = Foreground(title='STM32 manual', executable=r'C:\Apps\browser.exe')
-        state, _ = classifier.observe(now, 'Networking', window, True, True, sprint)
-        self.assertEqual(state, ActivityState.UNCERTAIN)
-        classifier.observe(now + 2, 'Networking', window, True, True, sprint)
-        await classifier.job
-        messages, prompt = mock.chat.await_args.args
-        facts = json.loads(messages[0]['content'])
-        self.assertEqual(facts['sprint']['goal'], 'Learn VLANs')
-        self.assertEqual(facts['application'], 'browser.exe')
-        self.assertIn('planning or thinking', prompt)
-        result = classifier.observe(now + 3, 'Networking', window, True, True, sprint)
-        self.assertEqual(result[0], ActivityState.OFF_TASK)
-        result = classifier.observe(now + 3, 'Networking', window, False, False, sprint)
-        self.assertEqual(result[0], ActivityState.UNCERTAIN)
-        await classifier.close()
+    def test_live_sprint_goal_replaces_old_goal(self):
+        item = self.start(goal='Learn VLANs', description='Network lab')
+        context = ContextAggregator(Privacy({}))
+        context.sample(5, Foreground(title='STM32 manual', executable='editor.exe'))
+        facts, _ = context.snapshot(9, self.store.llm_context, 0)
+        stream = ContextStream()
+        stream.start(item, facts['sprint'])
+        self.assertEqual(stream.preview()['SPRINT_STARTED']['goal'], 'Learn VLANs')
+        old_stamp = stream.stamp
+        self.command(item, 'edit', goal='Read the STM32 manual')
+        facts, _ = context.snapshot(10, self.store.llm_context, 0)
+        stream.start(item, facts['sprint'], 'SPRINT_UPDATED')
+        self.assertNotEqual(old_stamp, stream.stamp)
+        self.assertEqual(stream.preview()['SPRINT_UPDATED']['goal'], 'Read the STM32 manual')

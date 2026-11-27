@@ -16,50 +16,26 @@
 # Этот проект использует библиотеки, лицензированные под MIT, BSD и LGPL лицензиями.
 # ---------------------------------------------------------------
 
-import io
-import os
-import sys
-import signal
-import subprocess
-
-# Код выхода «перезапусти меня» (кнопка в веб-панели), совпадает с panel.RESTART_CODE
-RESTART_CODE = 75
-
-# Лёгкий процесс-надзиратель: запускает трекер дочерним процессом и поднимает
-# его заново после «Перезапустить» в панели. Так перезапуск не завершает
-# start.bat (и не гасит llama-server), а память старого процесса освобождается.
-if __name__ == "__main__" and os.environ.get("WORKREMINDER_CHILD") != "1":
-    env = {**os.environ, "WORKREMINDER_CHILD": "1"}
-    while True:
-        child = subprocess.Popen([sys.executable, *sys.argv], env=env)
-        while True:
-            try:
-                code = child.wait()
-                break
-            except KeyboardInterrupt:
-                continue  # Ctrl+C получает и дочерний процесс, ждём его штатного выхода
-        if code != RESTART_CODE:
-            sys.exit(code)
-        print("[INFO] Перезапуск по запросу из веб-панели...")
-
-if sys.platform == "darwin":
-    from AppKit import NSWorkspace
-
-import time
-import pygame
-from tts import Speaker
 import asyncio
-import json
 import logging
+import os
+import signal
+import sys
+import time
+
+import pygame
+
 import discord
 import panel
-from ai_client import AIClientFactory
-from assistant import FocusAssistant
 from config_store import load_config
 from focus_meter import Foreground
 from focus_runtime import FocusController, Phase
 from sprints import SprintManager
-from voicepack import ClipPlayer, Event, OBSERVATIONS, VoicePackNotifier, notification_mode
+from voicepack import Event, VoicePackNotifier
+
+if sys.platform == 'darwin':
+    from AppKit import NSWorkspace
+
 
 # Вывод копируется в буфер, чтобы панель могла показать логи
 panel.capture_output()
@@ -77,10 +53,13 @@ pygame.mixer.pre_init(
     channels=2,
     buffer=config.get('audio_buffer', 2048),
 )
-pygame.mixer.init()
+try:
+    pygame.mixer.init()
+except pygame.error as error:
+    logging.warning('[Audio] %s', error)
 
-# Инициализация AI клиента
-ai_client = AIClientFactory.create_client(config)
+
+RESTART_CODE = 75
 
 discord_presence_state = config.get('discord_presence', False)
 sound_on = True
@@ -96,9 +75,6 @@ def log_message(level, message):
     if level <= debug_level:
         print(message)
 
-# Логи модулей ai_client/assistant выводятся по тому же уровню дебага.
-# force=True: discordrpc при импорте уже настраивает logging, и без него
-# этот вызов ничего не делал (уровень дебага и формат не применялись)
 logging.basicConfig(
     level={0: logging.ERROR, 1: logging.WARNING, 2: logging.INFO}.get(debug_level, logging.DEBUG),
     format="[%(levelname)s] %(message)s",
@@ -115,63 +91,6 @@ def portable_foreground():
             return Foreground(title=name, executable=name)
     return Foreground()
 
-
-# Озвучивание: цепочка движков edge -> piper -> sapi (см. tts.py)
-speaker = Speaker(config)
-
-audio_coordinator = ClipPlayer()
-
-async def speak_text(text):
-    async with audio_coordinator.sequence():
-        audio = await speaker.synthesize(text)
-        if audio:
-            await audio_coordinator.play(io.BytesIO(audio[0]), 1.0)
-
-# AI ассистент: промпты, контекст, память диалога и озвучивание ответов
-assistant = FocusAssistant(ai_client, config, speak_text)
-
-def save_session_stats(quiet=False):
-    """Сохраняет статистику сессий в файл"""
-    try:
-        with open('session_stats.json', 'w', encoding='utf-8') as f:
-            json.dump(session_stats, f, ensure_ascii=False, indent=2)
-        if not quiet:
-            log_message(2, "[INFO] Статистика сессий сохранена")
-    except Exception as e:
-        log_message(1, f"[ERROR] Ошибка при сохранении статистики: {e}")
-
-def load_session_stats():
-    """Загружает статистику сессий из файла"""
-    try:
-        with open('session_stats.json', 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {
-            "total_focus_time": 0,
-            "total_break_time": 0,
-            "completed_sessions": 0,
-            "current_session_start": time.time()
-        }
-    except Exception as e:
-        log_message(1, f"[ERROR] Ошибка при загрузке статистики: {e}")
-        return {
-            "total_focus_time": 0,
-            "total_break_time": 0,
-            "completed_sessions": 0,
-            "current_session_start": time.time()
-        }
-
-# Загружаем статистику при запуске
-session_stats = load_session_stats()
-
-def today_stats():
-    """Итоги дня для панели: время в фокусе, в отвлечениях и число отвлечений"""
-    today = time.strftime('%Y-%m-%d')
-    stats = session_stats.get("today")
-    if not isinstance(stats, dict) or stats.get("date") != today:
-        stats = {"date": today, "focus_seconds": 0, "lost_seconds": 0, "distractions": 0}
-        session_stats["today"] = stats
-    return stats
 
 # Флаг для корректного завершения
 shutdown_flag = False
@@ -204,10 +123,7 @@ class Runtime:
     def __init__(self):
         self.started_at = time.time()
         self.sprints = SprintManager()
-        event_config = config
-        if not notification_mode(config):
-            event_config = {**config, 'notification_mode': 'tts'}
-        self.voicepack = VoicePackNotifier(event_config, ai_client, speaker, player=audio_coordinator)
+        self.voicepack = VoicePackNotifier(config)
         self.focus = None
         self.startup_managed = os.environ.get('FOCUSWITHAI_MANAGED') == '1'
         self.startup_ready = False
@@ -225,18 +141,6 @@ class Runtime:
             get_window=None if sys.platform == 'win32' else portable_foreground,
         )
 
-    @property
-    def assistant(self):
-        return assistant
-
-    @property
-    def speaker(self):
-        return speaker
-
-    @property
-    def target_window(self):
-        return self.focus.status()['window'] if self.focus else None
-
     def state(self):
         sprint = self.sprints.summary()
         focus = self.focus.status() if self.focus else None
@@ -251,12 +155,7 @@ class Runtime:
             'sprint_revision': self.sprints.revision,
             'active_window': focus['window'] if focus else '',
             'toggles': {'sound': sound_on, 'ai': ai_on, 'discord': discord_presence_state},
-            'today': dict(today_stats()),
-            'events': [list(event) for event in assistant.events],
-            'stats': {key: value for key, value in session_stats.items() if key != 'today'},
-            'voicepack': {'decision': self.voicepack.decision, 'mode': self.voicepack.mode,
-                          'disabled': sorted(event.value for event in self.voicepack.disabled)}
-            if self.voicepack else None,
+            'audio_mode': self.voicepack.mode,
             'focus': focus,
         }
 
@@ -270,18 +169,14 @@ class Runtime:
                      sprint['state'] == 'PAUSED', sprint, self.sprints.llm_context)
 
     def play_focus_event(self, event, task, reason, mode, on_play=None):
-        if self.focus and self.focus.live and self.voicepack.mode in ('live', 'alarm_live', 'tts', 'alarm_tts'):
-            return False  # The locally admitted live proposal owns the complete sequence.
-        if self.voicepack and sound_on and self.focus_phase().active:
-            return self.voicepack.notify(event, {'observation': reason or OBSERVATIONS[event], 'task': task},
-                                         use_ai=False, mode_override=mode, on_play=on_play)
+        if sound_on and self.focus_phase().active:
+            return self.voicepack.notify(event, mode_override=mode, on_play=on_play)
         return False
 
     def stop_audio(self):
-        if self.focus and self.focus.live:
+        if self.focus:
             self.focus.live.audio.cancel()
-        if self.voicepack:
-            self.voicepack.stop_audio()
+        self.voicepack.stop_audio()
 
     def sprint_command(self, action, body, *, at=None):
         before = self.focus_phase()
@@ -294,7 +189,7 @@ class Runtime:
                 terminal = {'break': 'BREAK_STARTED', 'pause': 'SPRINT_PAUSED', 'complete': 'SPRINT_COMPLETED',
                             'cancel': 'SPRINT_COMPLETED'}.get(action)
                 self.focus.suspend(terminal, paused=bool(after.sprint and after.sprint['state'] in ('PAUSED', 'BREAK')))
-                if self.focus.live and after.active:
+                if after.active:
                     if not before.sprint or before.sprint['id'] != after.sprint['id']:
                         self.focus.live.next_start = 'SPRINT_STARTED'
                     elif before.sprint['state'] == 'BREAK':
@@ -350,7 +245,7 @@ class Runtime:
             self.focus.action(action[6:], value)
         elif action in ('task_completed', 'attention'):
             phase = self.focus_phase()
-            if not phase.active or not self.voicepack:
+            if not phase.active:
                 raise ValueError('Звуковые команды доступны в активном спринте.')
             self.play_focus_event(Event.TASK_COMPLETED if action == 'task_completed' else Event.ATTENTION,
                                   phase.task, '', None)
@@ -360,10 +255,6 @@ class Runtime:
         else:
             raise ValueError(f'Неизвестная команда: {action}')
         wake_event.set()
-
-    def reset_stats(self):
-        session_stats.update({'total_focus_time': 0, 'total_break_time': 0, 'completed_sessions': 0})
-        save_session_stats()
 
     def request_restart(self):
         global restart_requested
@@ -383,9 +274,8 @@ async def main():
     global wake_event
     wake_event = asyncio.Event()
     runtime = Runtime()
-    panel_config = {**config, 'panel_enabled': True, 'panel_open_browser': False} if runtime.startup_managed else config
-    panel_runner = await panel.start_panel(runtime, panel_config)
-    if runtime.startup_managed and panel_runner is None:
+    panel_runner = await panel.start_panel(runtime, config)
+    if panel_runner is None:
         return 1
     runtime.startup_ready = panel_runner is not None
     while not runtime.startup_gate.is_set() and not shutdown_flag:
@@ -419,11 +309,8 @@ async def main():
             runtime.sprints.checkpoint()
         except OSError:
             logging.exception('[Sprint] Could not save the sprint at shutdown.')
-        if runtime.voicepack:
-            await runtime.voicepack.close()
-        if panel_runner:
-            await panel_runner.cleanup()
-        await ai_client.close()
+        await runtime.voicepack.close()
+        await panel_runner.cleanup()
         discord.stop_rpc()
 
 

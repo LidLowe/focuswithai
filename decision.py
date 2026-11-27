@@ -1,6 +1,6 @@
 """Local confidence and persistence gate for focus advice."""
 
-from activity_ai import Classification
+from activity_protocol import Classification
 from activity_context import setting
 from focus_meter import ActivityState
 

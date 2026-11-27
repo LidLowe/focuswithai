@@ -7,8 +7,24 @@ import sys
 from pathlib import Path
 
 
-SECRET_KEYS = ('api_key', 'openai_api_key', 'google_assistant_api_key')
-VERSION = 1
+GEMINI_KEY = 'google_assistant_api_key'
+SECRET_KEYS = (GEMINI_KEY,)
+VERSION = 2
+DEFAULT_PORT = 8765
+
+
+def defaults():
+    from activity_context import CONTEXT_DEFAULTS
+    from focus_meter import FOCUS_DEFAULTS
+    from gemini_live import DEFAULTS as GEMINI_DEFAULTS
+    from startup_manager import STARTUP_DEFAULTS
+    from voicepack import DEFAULTS as AUDIO_DEFAULTS
+
+    return {
+        'schema_version': VERSION, 'panel_port': DEFAULT_PORT, 'debug_level': 0,
+        'discord_presence': False, 'audio_frequency': 48000, 'audio_buffer': 2048,
+        **CONTEXT_DEFAULTS, **FOCUS_DEFAULTS, **GEMINI_DEFAULTS, **STARTUP_DEFAULTS, **AUDIO_DEFAULTS,
+    }
 
 
 def target(path, key):
@@ -48,7 +64,7 @@ def store_secret(path, key, value):
 
 
 def public_config(data):
-    return {key: value for key, value in data.items() if key not in SECRET_KEYS}
+    return {key: value for key, value in data.items() if key not in {*SECRET_KEYS, 'api_key', 'openai_api_key'}}
 
 
 def write_disk(path, data):
@@ -59,32 +75,61 @@ def write_disk(path, data):
     os.replace(temporary, path)
 
 
+def migrate(path, original):
+    """Preserve the pre-consolidation settings without copying credentials to disk."""
+    backup = path.with_name(path.stem + '.pre-gemini-live.json')
+    if not backup.exists():
+        write_disk(backup, public_config(original))
+
+    known = defaults()
+    data = {key: value for key, value in original.items() if key in known}
+    data['schema_version'] = VERSION
+    if original.get('activity_provider_mode') != 'gemini_live':
+        data['activity_allow_remote'] = False
+        data['activity_send_remote_images'] = False
+    if 'gemini_live_prompt' not in data:
+        if original.get('activity_system_prompt'):
+            data['gemini_live_prompt'] = original['activity_system_prompt']
+        elif original.get('live_style') == 'concise':
+            data['gemini_live_prompt'] = 'Кратко и спокойно.'
+    mode = original.get('notification_mode')
+    if mode == 'alarm_tts':
+        data['notification_mode'] = 'alarm_live'
+    elif not mode and original.get('voicepack_enabled'):
+        data['notification_mode'] = 'voicepack'
+    elif mode in ('tts', ''):
+        data['notification_mode'] = 'live'
+    return data
+
+
 def load_config(path='config.json'):
     path = Path(path)
-    data = json.loads(path.read_text(encoding='utf-8-sig'))
-    if not isinstance(data, dict) or type(data.get('schema_version', 0)) is not int or not 0 <= data.get('schema_version', 0) <= VERSION:
+    try:
+        original = json.loads(path.read_text(encoding='utf-8-sig'))
+    except FileNotFoundError:
+        return {}
+    version = original.get('schema_version', 0) if isinstance(original, dict) else None
+    if type(version) is not int or not 0 <= version <= VERSION:
         raise ValueError('Неподдерживаемая версия config.json.')
-    before = dict(data)
-    data['schema_version'] = VERSION
+    data = migrate(path, original) if version < VERSION else original
     if sys.platform == 'win32':
-        for key in SECRET_KEYS:
-            if key in data:
-                value = data.pop(key)
-                if value:
-                    store_secret(path, key, value)
-        if before != data:
-            write_disk(path, data)
-        return {**data, **{key: read_secret(path, key) for key in SECRET_KEYS}}
-    if before != data:
+        if data.get(GEMINI_KEY):
+            store_secret(path, GEMINI_KEY, data[GEMINI_KEY])
+        data = public_config(data)
+    if original != data:
         write_disk(path, data)
+    if sys.platform == 'win32':
+        data[GEMINI_KEY] = read_secret(path, GEMINI_KEY)
     return data
 
 
 def save_config(data, path='config.json'):
     path = Path(path)
     data = {**data, 'schema_version': VERSION}
+    known = defaults()
+    if data.keys() - known.keys():
+        raise ValueError('Неизвестные настройки FocusWithAI.')
     if sys.platform == 'win32':
-        for key in SECRET_KEYS:
-            store_secret(path, key, data.get(key, ''))
+        store_secret(path, GEMINI_KEY, data.get(GEMINI_KEY, ''))
         data = public_config(data)
     write_disk(path, data)

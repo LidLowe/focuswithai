@@ -1,16 +1,7 @@
-# ---------------------------------------------------------------
-# Веб-панель workReminder
-# Описание: локальный веб-сервер (только 127.0.0.1), через который
-#           настраиваются config.json, sessions.jsonl и память ассистента.
-#   - внутри main.py: видит живое состояние трекера и управляет им
-#     (пауза, пропуск блока, перезапуск);
-#   - отдельно (python panel.py): только редактирование файлов.
-# ---------------------------------------------------------------
+"""Local FocusWithAI Dashboard and control API."""
 
 import asyncio
 import copy
-import importlib.util
-import io
 import json
 import logging
 import os
@@ -18,36 +9,27 @@ import re
 import sys
 import threading
 import time
-import webbrowser
 from collections import deque
 from typing import Any, Dict, List, Optional
 
-import aiohttp
 from aiohttp import web
 from audio_import import save_clip
-from activity_context import CONTEXT_DEFAULTS
-from config_store import SECRET_KEYS, VERSION, load_config, public_config, save_config
-from focus_meter import FOCUS_DEFAULTS
-from startup_manager import STARTUP_DEFAULTS, StartupTask
+from config_store import DEFAULT_PORT, SECRET_KEYS, VERSION, defaults, load_config, public_config, save_config
+from gemini_live import MODELS, VOICES, GeminiLiveTransport, validate_preferences
+from live_session import LiveSetupError
+from startup_manager import StartupTask
 from voicepack import (AlarmEngine, ClipPlayer, DEFAULTS as VOICEPACK_DEFAULTS, Event, MAX_CLIP_BYTES,
-                       PlaybackStopped, VoicePackCatalog, VoicePackEngine, notification_mode)
+                       PlaybackStopped, VoicePackCatalog, VoicePackEngine)
 
 CONFIG_FILE = 'config.json'
-SESSIONS_FILE = 'sessions.jsonl'
-STATS_FILE = 'session_stats.json'
 BACKUP_DIR = 'backups'
-SOUNDS_DIR = 'sounds'
 BACKUPS_KEPT = 10
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'panel_web')
 
-DEFAULT_PORT = 8765
-# Код выхода, по которому main.py перезапускает сам себя
-RESTART_CODE = 75
 
 # Ключи API в панель не отдаются, вместо них приходит маска
 MASK = '••••••••'
 
-TTS_ENGINES = ('silero', 'edge', 'piper', 'sapi')
 
 
 # ---------- захват вывода для просмотра логов в панели ----------
@@ -209,194 +191,10 @@ def list_backups() -> List[Dict[str, Any]]:
 def write_config(config: Dict[str, Any]):
     if type(config.get('schema_version', VERSION)) is not int or config.get('schema_version', VERSION) != VERSION:
         raise ValueError('Неподдерживаемая версия конфигурации.')
-    backup_config()
+    validate_preferences(config)
+    if os.path.exists(CONFIG_FILE):
+        backup_config()
     save_config(config)
-
-
-def read_sessions() -> List[Dict[str, Any]]:
-    items = []
-    try:
-        with open(SESSIONS_FILE, 'r', encoding='utf-8') as f:
-            for line in f:
-                if line.strip():
-                    raw = json.loads(line)
-                    items.append({'name': raw.get('name', ''), 'focus': bool(raw.get('focus', True)),
-                                  'min': int(raw.get('min', 25))})
-    except FileNotFoundError:
-        pass
-    return items
-
-
-def validate_sessions(items: Any) -> List[Dict[str, Any]]:
-    if not isinstance(items, list):
-        raise ValueError('Ожидается список блоков')
-    result = []
-    for i, item in enumerate(items, 1):
-        if not isinstance(item, dict):
-            raise ValueError(f'Блок {i}: ожидается объект')
-        minutes = item.get('min')
-        if not isinstance(minutes, int) or isinstance(minutes, bool) or not 1 <= minutes <= 600:
-            raise ValueError(f'Блок {i}: длительность должна быть целым числом от 1 до 600 минут')
-        result.append({'name': str(item.get('name', '')), 'focus': bool(item.get('focus', True)),
-                       'min': minutes})
-    return result
-
-
-def write_sessions(items: List[Dict[str, Any]]):
-    lines = [json.dumps(item, ensure_ascii=False) for item in validate_sessions(items)]
-    write_text_atomic(SESSIONS_FILE, '\n'.join(lines) + '\n' if lines else '')
-
-
-def memory_path(config: Dict[str, Any]) -> Optional[str]:
-    return config.get('ai_memory_file', 'assistant_memory.json')
-
-
-# ---------- значения по умолчанию (как в коде, через config.get) ----------
-
-def defaults_for(config: Dict[str, Any]) -> Dict[str, Any]:
-    from ai_client import LlamaClient, assistant_name
-    from assistant import (DEFAULT_FALLBACKS, DEFAULT_INSTRUCTIONS, DEFAULT_RULES,
-                           DEFAULT_STYLES, FACT_TOPICS, LEGACY_KEYS, _clean_legacy)
-    defaults = {
-        'debug_level': 0,
-        'target_apps': ["Visual Studio Code"],
-        'reminder_interval': 30,
-        'punishment_interval': 60,
-        'punishment_cooldown': config.get('punishment_interval', 60),
-        'praise_interval': 1800,
-        'interesting_fact_interval': 60,
-        'reminder_sound': 'H_WARNING.mp3',
-        'reminder_volume': 1.0,
-        'discord_presence': False,
-        'audio_frequency': 48000,
-        'audio_buffer': 2048,
-        'ai_provider': 'llama',
-        'ai_fallback_providers': [],
-        'ai_timeout': 30,
-        'ai_retries': 2,
-        'llama_url': 'http://127.0.0.1:8080/completion',
-        'llama_user_label': 'System',
-        'api_key': '',
-        'stop': ["</s>", "User:"],
-        **LlamaClient.SAMPLING_KEYS,
-        'openai_base_url': 'http://127.0.0.1:8080/v1',
-        'openai_model': 'local-model',
-        'openai_api_key': '',
-        'openai_max_tokens': 300,
-        'openai_thinking': False,
-        'google_assistant_api_key': '',
-        'google_model': 'gemini-2.5-flash',
-        'google_max_tokens': 400,
-        'google_temperature': 0.7,
-        'google_top_p': 0.95,
-        'google_top_k': 40,
-        'prompt': "You are helpful assistant",
-        'assistant_name': assistant_name(config),
-        'ai_response_rules': DEFAULT_RULES,
-        'ai_max_chars': 400,
-        'ai_max_sentences': 2,
-        'ai_drop_questions': True,
-        'ai_repeat_threshold': 0.6,
-        'ai_context_budget': 1500,
-        'ai_history_size': 0,
-        'ai_event_log_size': 8,
-        'ai_memory_file': 'assistant_memory.json',
-        'ai_style_hints': DEFAULT_STYLES,
-        'fallback_phrases': DEFAULT_FALLBACKS,
-        'ai_fact_topics': FACT_TOPICS,
-        'tts_engines': list(TTS_ENGINES),
-        'tts_failure_cooldown': 600,
-        'silero_model': 'voices/silero_v5_6_ru.pt',
-        'silero_speaker': 'xenia',
-        'silero_sample_rate': 48000,
-        'silero_threads': 8,
-        'silero_rate': '',
-        'silero_pitch': '',
-        'edge_tts_voice': 'ru-RU-SvetlanaNeural',
-        'edge_tts_rate': '+0%',
-        'piper_model': 'voices/ru_RU-irina-medium.onnx',
-        'piper_length_scale': 1.0,
-        'sapi_voice': 'Irina',
-        'sapi_rate': 0,
-        **VOICEPACK_DEFAULTS,
-        **FOCUS_DEFAULTS,
-        **CONTEXT_DEFAULTS,
-        'schema_version': VERSION,
-        **STARTUP_DEFAULTS,
-        'notification_mode': notification_mode(config),
-        'panel_enabled': True,
-        'panel_port': DEFAULT_PORT,
-        'panel_open_browser': False,
-    }
-    for event, text in DEFAULT_INSTRUCTIONS.items():
-        legacy = config.get(LEGACY_KEYS[event])
-        defaults[f'{event}_instruction'] = _clean_legacy(legacy) if legacy else text
-    return defaults
-
-
-# Ключи, которые читает программа, но которых нет в defaults_for
-EXTRA_KNOWN = {
-    'openai_temperature', 'openai_top_k', 'openai_top_p', 'openai_min_p',
-    'openai_presence_penalty', 'openai_frequency_penalty', 'openai_repeat_penalty',
-    'openai_extra_params', 'google_thinking_budget', 'edge_tts_timeout',
-    'punishment_subprompt', 'praise_subprompt', 'interesting_fact_subprompt',
-}
-
-
-def unknown_keys(config: Dict[str, Any]) -> List[str]:
-    known = set(defaults_for(config)) | EXTRA_KNOWN
-    return [key for key in config if key not in known]
-
-
-# ---------- окружение ----------
-
-def open_windows(targets: List[str]) -> List[Dict[str, str]]:
-    """Открытые окна, которые не попадают в рабочие приложения"""
-    if sys.platform != 'win32':
-        return []
-    import pygetwindow as gw
-    skip = {'Program Manager', 'Windows Input Experience', 'Параметры', 'Settings'}
-    seen, result = set(), []
-    for title in gw.getAllTitles():
-        title = title.strip()
-        if not title or any(app in title for app in targets):
-            continue
-        # «Документ — Приложение»: предлагаем название приложения
-        name = re.split(r"\s[-—–]\s", title)[-1].strip()
-        if not name or name in seen or name in skip:
-            continue
-        seen.add(name)
-        result.append({'title': title, 'name': name})
-    return result[:30]
-
-
-def engine_status(name: str, config: Dict[str, Any]) -> Dict[str, Any]:
-    has = lambda module: importlib.util.find_spec(module) is not None  # noqa: E731
-    if name == 'silero':
-        model = config.get('silero_model', 'voices/silero_v5_6_ru.pt')
-        if not has('torch'):
-            return {'ok': False, 'note': 'не установлен PyTorch'}
-        if not os.path.exists(model):
-            return {'ok': False, 'note': f'нет модели {model}'}
-        return {'ok': True, 'note': f"модель на месте · голос {config.get('silero_speaker', 'xenia')}"}
-    if name == 'edge':
-        if not has('edge_tts'):
-            return {'ok': False, 'note': 'не установлен edge-tts'}
-        return {'ok': True, 'note': config.get('edge_tts_voice', 'ru-RU-SvetlanaNeural')}
-    if name == 'piper':
-        model = config.get('piper_model', 'voices/ru_RU-irina-medium.onnx')
-        if not has('piper'):
-            return {'ok': False, 'note': 'не установлен piper-tts'}
-        if not os.path.exists(model):
-            return {'ok': False, 'note': f'нет модели {model}'}
-        return {'ok': True, 'note': os.path.splitext(os.path.basename(model))[0]}
-    if name == 'sapi':
-        if sys.platform != 'win32':
-            return {'ok': False, 'note': 'только Windows'}
-        if not has('comtypes'):
-            return {'ok': False, 'note': 'не установлен comtypes'}
-        return {'ok': True, 'note': config.get('sapi_voice', 'Irina')}
-    return {'ok': False, 'note': 'неизвестный движок'}
 
 
 # ---------- сервер ----------
@@ -424,8 +222,6 @@ def _handler(func):
 class Panel:
     def __init__(self, runtime=None):
         self.rt = runtime
-        self._engines: Dict[tuple, Any] = {}
-        self._tts_lock = asyncio.Lock()
         notifier = runtime.voicepack if runtime else None
         self._player = notifier.player if notifier else ClipPlayer()
         self._voicepacks = notifier.engine if notifier else VoicePackEngine(VoicePackCatalog(), self._player)
@@ -445,35 +241,14 @@ class Panel:
         r.add_post('/api/startup', self.set_startup)
         r.add_get('/api/config', self.get_config)
         r.add_put('/api/config', self.put_config)
-        r.add_get('/api/sessions', self.get_sessions)
-        r.add_put('/api/sessions', self.put_sessions)
-        r.add_get('/api/memory', self.get_memory)
-        r.add_post('/api/memory/forget', self.memory_forget)
-        r.add_post('/api/memory/clear', self.memory_clear)
-        r.add_post('/api/stats/reset', self.stats_reset)
-        r.add_get('/api/raw', self.get_raw)
-        r.add_put('/api/raw', self.put_raw)
-        r.add_get('/api/backups', self.get_backups)
-        r.add_post('/api/backups/restore', self.restore_backup)
-        r.add_get('/api/export', self.export)
-        r.add_get('/api/windows', self.windows)
-        r.add_get('/api/tts', self.tts_status)
-        r.add_get('/api/voicepacks', self.voicepacks)
-        r.add_post('/api/test/voicepack', self.test_voicepack)
         r.add_get('/api/audio/packs', self.audio_packs)
         r.add_post('/api/audio/preview', self.audio_preview)
         r.add_post('/api/audio/import', self.audio_import)
         r.add_post('/api/audio/stop', self.audio_stop)
-        r.add_post('/api/test/tts', self.test_tts)
-        r.add_post('/api/test/sound', self.test_sound)
-        r.add_post('/api/test/ai', self.test_ai)
         r.add_post('/api/test/gemini-live', self.test_gemini_live)
-        r.add_post('/api/test/reply', self.test_reply)
-        r.add_post('/api/models', self.models)
         r.add_post('/api/control', self.control)
         r.add_post('/api/process', self.process)
         r.add_get('/api/logs', self.logs)
-        r.add_post('/api/upload/sound', self.upload_sound)
 
     @web.middleware
     async def _guard(self, request, handler):
@@ -532,27 +307,10 @@ class Panel:
 
     @_handler
     async def status(self, request):
-        config = read_json(CONFIG_FILE, {}) or {}
-        data = {
-            'live': self.rt is not None,
-            'pid': os.getpid(),
-            'now': time.time(),
-            'config_mtime': os.path.getmtime(CONFIG_FILE) if os.path.exists(CONFIG_FILE) else None,
-            'sessions': read_sessions(),
-        }
+        data = {'live': self.rt is not None, 'pid': os.getpid(), 'now': time.time(),
+                'config_mtime': os.path.getmtime(CONFIG_FILE) if os.path.exists(CONFIG_FILE) else None}
         if self.rt:
             data.update(self.rt.state())
-        else:
-            stats = read_json(STATS_FILE, {}) or {}
-            today = stats.pop('today', None)
-            memory = read_json(memory_path(config) or '', {}) if memory_path(config) else {}
-            is_today = (memory or {}).get('date') == time.strftime('%Y-%m-%d')
-            data.update({
-                'stats': stats,
-                'today': today if today and today.get('date') == time.strftime('%Y-%m-%d') else None,
-                'events': memory.get('events', []) if is_today else [],
-                'block_distractions': memory.get('distractions', {}) if is_today else {},
-            })
         return _json(data)
 
     @_handler
@@ -623,9 +381,9 @@ class Panel:
     def _config_payload(self, config: Dict[str, Any]) -> Dict[str, Any]:
         return {
             'config': mask_config(config),
-            'defaults': defaults_for(config),
-            'unknown': unknown_keys(config),
-            'mtime': os.path.getmtime(CONFIG_FILE),
+            'defaults': defaults(),
+            'models': MODELS, 'voices': VOICES,
+            'mtime': os.path.getmtime(CONFIG_FILE) if os.path.exists(CONFIG_FILE) else None,
             'live': self.rt is not None,
         }
 
@@ -637,6 +395,10 @@ class Panel:
     async def put_config(self, request):
         body = await self._body(request)
         config = load_config()
+        known = defaults()
+        for path in [*(body.get('set') or {}), *(body.get('unset') or [])]:
+            if path.split('.', 1)[0] not in known:
+                raise ValueError('Неизвестная настройка FocusWithAI.')
         for path, value in (body.get('set') or {}).items():
             if path in SECRET_KEYS and value == MASK:
                 continue
@@ -646,188 +408,6 @@ class Panel:
         write_config(config)
         logging.info(f"[PANEL] config.json сохранён: {', '.join([*(body.get('set') or {}), *(body.get('unset') or [])])}")
         return _json(self._config_payload(config))
-
-    @_handler
-    async def get_sessions(self, request):
-        return _json({'sessions': read_sessions()})
-
-    @_handler
-    async def put_sessions(self, request):
-        body = await self._body(request)
-        write_sessions(body.get('sessions'))
-        logging.info('[PANEL] sessions.jsonl сохранён')
-        return _json({'sessions': read_sessions()})
-
-    # --- файлы вручную ---
-
-    @_handler
-    async def get_raw(self, request):
-        name = request.query.get('file')
-        if name == 'config':
-            text = json.dumps(mask_config(load_config()), ensure_ascii=False, indent=4) + '\n'
-            return _json({'text': text, 'lines': text.count('\n') + 1})
-        if name == 'sessions':
-            text = open(SESSIONS_FILE, 'r', encoding='utf-8').read() if os.path.exists(SESSIONS_FILE) else ''
-            return _json({'text': text, 'lines': text.count('\n') + 1})
-        raise ValueError('Неизвестный файл')
-
-    @_handler
-    async def put_raw(self, request):
-        body = await self._body(request)
-        name, text = body.get('file'), body.get('text', '')
-        if name == 'config':
-            try:
-                config = json.loads(text)
-            except json.JSONDecodeError as e:
-                raise ValueError(f'Ошибка JSON, строка {e.lineno}, позиция {e.colno}: {e.msg}')
-            if not isinstance(config, dict):
-                raise ValueError('config.json должен быть объектом { ... }')
-            stored = load_config()
-            for key in SECRET_KEYS:
-                if key not in config or config.get(key) == MASK:
-                    config[key] = stored.get(key, '')
-            write_config(config)
-            logging.info('[PANEL] config.json сохранён вручную')
-            return _json(self._config_payload(load_config()))
-        if name == 'sessions':
-            items = []
-            for n, line in enumerate(text.splitlines(), 1):
-                if line.strip():
-                    try:
-                        items.append(json.loads(line))
-                    except json.JSONDecodeError as e:
-                        raise ValueError(f'Строка {n}: {e.msg}')
-            write_sessions(items)
-            return _json({'sessions': read_sessions()})
-        raise ValueError('Неизвестный файл')
-
-    @_handler
-    async def get_backups(self, request):
-        return _json({'backups': list_backups()})
-
-    @_handler
-    async def restore_backup(self, request):
-        name = (await self._body(request)).get('name', '')
-        if not re.fullmatch(r'config-[\d-]+\.json', name):
-            raise ValueError('Неверное имя копии')
-        path = os.path.join(BACKUP_DIR, name)
-        saved = public_config(read_json(path))
-        current = load_config()
-        write_config({**saved, **{key: current.get(key, '') for key in SECRET_KEYS}})
-        logging.info(f'[PANEL] config.json восстановлен из {name}')
-        return _json(self._config_payload(load_config()))
-
-    @_handler
-    async def export(self, request):
-        config = load_config()
-        for key in SECRET_KEYS:
-            if key in config:
-                config[key] = ''
-        return web.Response(text=json.dumps(config, ensure_ascii=False, indent=4), content_type='application/json',
-                            headers={'Content-Disposition': 'attachment; filename="workreminder-config.json"'})
-
-    # --- память ---
-
-    def _memory(self) -> Dict[str, Any]:
-        config = read_json(CONFIG_FILE, {}) or {}
-        path = memory_path(config)
-        if self.rt:
-            data = self.rt.assistant.memory_snapshot()
-            stats = {k: v for k, v in self.rt.state()['stats'].items()}
-        else:
-            data = (read_json(path, {}) if path else {}) or {}
-            stats = read_json(STATS_FILE, {}) or {}
-        stats.pop('today', None)
-        return {
-            'live': self.rt is not None,
-            'file': path,
-            'date': data.get('date'),
-            'is_today': data.get('date') == time.strftime('%Y-%m-%d'),
-            'events': data.get('events', []),
-            'recent_replies': data.get('recent_replies', []),
-            'recent_facts': data.get('recent_facts', []),
-            'distractions': data.get('distractions', {}),
-            'history': len(data.get('history', [])),
-            'event_log_size': config.get('ai_event_log_size', 8),
-            'stats': stats,
-        }
-
-    def _edit_memory_file(self, change):
-        path = memory_path(read_json(CONFIG_FILE, {}) or {})
-        if not path:
-            raise ValueError('Память выключена (ai_memory_file = null)')
-        data = read_json(path, {}) or {}
-        change(data)
-        write_json_atomic(path, data, indent=1)
-
-    @_handler
-    async def get_memory(self, request):
-        return _json(self._memory())
-
-    @_handler
-    async def memory_forget(self, request):
-        body = await self._body(request)
-        kind, index = body.get('kind'), int(body.get('index'))
-        if kind not in ('events', 'recent_replies', 'recent_facts'):
-            raise ValueError('Неизвестный раздел памяти')
-        if self.rt:
-            self.rt.assistant.forget(kind, index)
-        else:
-            self._edit_memory_file(lambda d: d.get(kind, []).pop(index))
-        return _json(self._memory())
-
-    @_handler
-    async def memory_clear(self, request):
-        scope = (await self._body(request)).get('scope')
-        if scope not in ('today', 'facts'):
-            raise ValueError('Неизвестная область очистки')
-        if self.rt:
-            self.rt.assistant.clear_memory(scope)
-        else:
-            def change(d):
-                keys = ['recent_facts'] if scope == 'facts' else ['history', 'events', 'recent_replies']
-                for key in keys:
-                    d[key] = []
-                if scope == 'today':
-                    d['distractions'] = {}
-            self._edit_memory_file(change)
-        return _json(self._memory())
-
-    @_handler
-    async def stats_reset(self, request):
-        if self.rt:
-            self.rt.reset_stats()
-        else:
-            stats = read_json(STATS_FILE, {}) or {}
-            stats.update({'total_focus_time': 0, 'total_break_time': 0, 'completed_sessions': 0})
-            write_json_atomic(STATS_FILE, stats, indent=2)
-        return _json(self._memory())
-
-    # --- окружение и проверки ---
-
-    @_handler
-    async def windows(self, request):
-        # Фильтр по рабочим приложениям делает панель: там несохранённый черновик списка
-        items = await asyncio.to_thread(open_windows, [])
-        return _json({'windows': items})
-
-    @_handler
-    async def tts_status(self, request):
-        config = load_config()
-        disabled = self.rt.speaker.disabled_until if self.rt else {}
-        now = time.time()
-        engines = []
-        for name in TTS_ENGINES:
-            item = {'name': name, **engine_status(name, config)}
-            if disabled.get(name, 0) > now:
-                item['failed_until'] = disabled[name]
-            engines.append(item)
-        return _json({'engines': engines})
-
-    @_handler
-    async def voicepacks(self, request):
-        packs = await asyncio.to_thread(self._voicepacks.catalog.list_packs)
-        return _json({'packs': packs})
 
     @_handler
     async def audio_packs(self, request):
@@ -882,83 +462,11 @@ class Panel:
         return _json({'ok': True})
 
     @_handler
-    async def test_voicepack(self, request):
-        body = await self._body(request)
-        try:
-            await self._voicepacks.preview(body['pack'], Event(body['event']), body['file'],
-                                          body.get('volume', VOICEPACK_DEFAULTS['voicepack_volume']))
-        except PlaybackStopped:
-            return _json({'ok': True, 'stopped': True})
-        except Exception as error:
-            return _json({'ok': False, 'error': f'Не удалось прослушать файл: {error}'}, 400)
-        return _json({'ok': True})
-
-    async def _play_preview(self, data, level=1.0):
-        try:
-            await self._player.play(io.BytesIO(data), level)
-        except PlaybackStopped:
-            pass
-
-    def _engine(self, name: str, config: Dict[str, Any]):
-        """Движок с настройками черновика; уже загруженная модель берётся повторно"""
-        from tts import ENGINES
-        if name not in ENGINES:
-            raise ValueError(f'Неизвестный движок {name}')
-        engine = ENGINES[name](config)
-        key = (name, getattr(engine, 'model_path', None) or getattr(engine, 'model', None))
-        cached = self._engines.get(key)
-        if cached is None and self.rt:
-            cached = next((e for e in self.rt.speaker.engines if e.name == name and
-                           (getattr(e, 'model_path', None) or getattr(e, 'model', None)) == key[1]), None)
-        if cached is not None:
-            for attr in ('_model', '_voice'):
-                if getattr(cached, attr, None) is not None:
-                    setattr(engine, attr, getattr(cached, attr))
-        return engine, key
-
-    @_handler
-    async def test_tts(self, request):
-        body = await self._body(request)
-        config = self._draft(body)
-        text = (body.get('text') or '').strip()[:400]
-        if not text:
-            raise ValueError('Пустая фраза')
-        names = [body['engine']] if body.get('engine') else config.get('tts_engines', list(TTS_ENGINES))
-        errors = []
-        async with self._tts_lock:
-            for name in names:
-                if not engine_status(name, config)['ok']:
-                    errors.append(f"{name}: {engine_status(name, config)['note']}")
-                    continue
-                try:
-                    engine, key = self._engine(name, config)
-                    started = time.monotonic()
-                    data, _ = await engine.synthesize(text)
-                    seconds = time.monotonic() - started
-                    self._engines[key] = engine
-                    await self._play_preview(data)
-                    return _json({'ok': True, 'engine': name, 'seconds': round(seconds, 2)})
-                except Exception as e:
-                    errors.append(f'{name}: {e!r}'[:300])
-        return _json({'ok': False, 'error': '; '.join(errors) or 'нет доступных движков'})
-
-    @_handler
-    async def test_sound(self, request):
-        config = self._draft(await self._body(request))
-        path = config.get('reminder_sound', 'H_WARNING.mp3')
-        with open(path, 'rb') as f:
-            data = f.read()
-        await self._play_preview(data, float(config.get('reminder_volume', 1.0)))
-        return _json({'ok': True})
-
-    @_handler
     async def test_gemini_live(self, request):
-        from gemini_live import MODEL
-        from live_backends import LiveSetupError, gemini_transport
-        transport = gemini_transport(self._draft(await self._body(request)))
+        transport = GeminiLiveTransport(self._draft(await self._body(request)))
         try:
-            await asyncio.wait_for(transport.connect('Connection check.', 24000), 12)
-            return _json({'model': MODEL, 'ok': True})
+            await asyncio.wait_for(transport.connect('Connection check.'), 12)
+            return _json({'model': transport.model, 'ok': True})
         except LiveSetupError:
             raise
         except Exception as error:
@@ -966,108 +474,8 @@ class Panel:
         finally:
             await transport.close()
 
-    @_handler
-    async def test_ai(self, request):
-        from ai_client import AIClientFactory
-        body = await self._body(request)
-        config = self._draft(body)
-        provider = body.get('provider') or config.get('ai_provider', 'llama')
-        config = {**config, 'ai_retries': 0, 'ai_timeout': min(int(config.get('ai_timeout', 30)), 30)}
-        client = AIClientFactory._create_single(provider, config)
-        started = time.monotonic()
-        try:
-            reply = await client.chat([{"role": "user", "content": "Ответь одним словом: на связи."}],
-                                      "Это проверка связи. Ответь одним-двумя словами.")
-            return _json({'ok': True, 'seconds': round(time.monotonic() - started, 2),
-                          'reply': (reply or '')[:200]})
-        except Exception as e:
-            return _json({'ok': False, 'error': str(e)[:400]})
-        finally:
-            await client.close()
-
-    @_handler
-    async def models(self, request):
-        config = self._draft(await self._body(request))
-        base = config.get('openai_base_url', 'http://127.0.0.1:8080/v1').rstrip('/')
-        key = config.get('openai_api_key', '')
-        headers = {'Authorization': f'Bearer {key}'} if key else {}
-        try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                async with session.get(f'{base}/models', headers=headers) as response:
-                    data = await response.json(content_type=None)
-        except Exception as e:
-            return _json({'ok': False, 'error': f'{e!r}'[:300]})
-        items = data.get('data') or data.get('models') or []
-        ids = [m.get('id') or m.get('name') for m in items if isinstance(m, dict)]
-        return _json({'ok': True, 'models': [i for i in ids if i]})
-
-    @_handler
-    async def test_reply(self, request):
-        from ai_client import AIClientFactory
-        from assistant import FocusAssistant
-        body = await self._body(request)
-        config = {**self._draft(body), 'ai_memory_file': None, 'ai_retries': 0}
-        event = body.get('event')
-        if event not in ('punishment', 'praise', 'fact'):
-            raise ValueError('Неизвестное событие')
-        values = body.get('values') or {}
-        client = AIClientFactory.create_client(config)
-
-        async def silent(_text):
-            pass
-
-        helper = FocusAssistant(client, config, silent)
-        target = (self.rt.target_window if self.rt else None) or (config.get('target_apps') or ['рабочем окне'])[0]
-        if self.rt:
-            live = self.rt.assistant
-            helper.events.extend(live.events)
-            helper.recent_replies.extend(live.recent_replies)
-            helper.recent_facts.extend(live.recent_facts)
-            helper.distractions.update(live.distractions)
-            helper.session_info = live.session_info
-        log_from = LOGS.seq
-        try:
-            if event == 'punishment':
-                distraction = str(values.get('window') or 'Telegram')
-                seconds = int(values.get('seconds') or 75)
-                result = await helper.preview(event, {
-                    'target': target, 'distraction': distraction, 'distracted_seconds': seconds,
-                    'count': sum(helper.distractions.values()) + 1}, (target, distraction))
-            elif event == 'praise':
-                minutes = int(values.get('minutes') or 60)
-                result = await helper.preview(event, {'target': target, 'minutes': minutes,
-                                                      'seconds': minutes * 60}, (target, minutes * 60))
-            else:
-                result = await helper.preview(event, {})
-        finally:
-            await client.close()
-        if not result['text']:
-            # Ассистент глотает ошибки и пишет их в лог: достаём причину оттуда
-            problems = [l['text'] for l in LOGS.since(log_from) if l['level'] in ('ERROR', 'WARNING')]
-            result['error'] = problems[-1][:400] if problems else 'Модель вернула пустой ответ'
-        return _json({'ok': bool(result['text']), **result})
-
-    @_handler
-    async def upload_sound(self, request):
-        name = os.path.basename(request.query.get('name', 'sound.mp3'))
-        stem, ext = os.path.splitext(name)
-        if ext.lower() not in ('.mp3', '.wav', '.ogg'):
-            raise ValueError('Подходят только mp3, wav и ogg')
-        data = await request.read()
-        if not data:
-            raise ValueError('Пустой файл')
-        os.makedirs(SOUNDS_DIR, exist_ok=True)
-        safe = re.sub(r'[^\w.\-]+', '_', stem)[:60] or 'sound'
-        path = f'{SOUNDS_DIR}/{safe}{ext.lower()}'
-        with open(path, 'wb') as f:
-            f.write(data)
-        return _json({'path': path})
-
-
 async def start_panel(runtime, config: Dict[str, Any]) -> Optional[web.AppRunner]:
     """Запускает панель на 127.0.0.1. Возвращает runner для остановки или None"""
-    if not config.get('panel_enabled', True):
-        return None
     port = int(config.get('panel_port', DEFAULT_PORT))
     runner = web.AppRunner(Panel(runtime).app, access_log=None)
     await runner.setup()
@@ -1077,31 +485,5 @@ async def start_panel(runtime, config: Dict[str, Any]) -> Optional[web.AppRunner
         logging.error(f"[PANEL] Веб-панель не запущена, порт {port} занят: {e}")
         await runner.cleanup()
         return None
-    url = f'http://127.0.0.1:{port}/#/sprints'
-    print(f"[INFO] Веб-панель: {url}", flush=True)
-    if config.get('panel_open_browser'):
-        webbrowser.open(url)
+    logging.info('[Dashboard] http://127.0.0.1:%s', port)
     return runner
-
-
-if __name__ == '__main__':
-    # Без трекера: только правка файлов, когда main.py не запущен
-    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-
-    async def run():
-        config = read_json(CONFIG_FILE, {}) or {}
-        runner = await start_panel(None, {**config, 'panel_enabled': True,
-                                          'panel_open_browser': '--no-browser' not in sys.argv})
-        if runner is None:
-            return
-        print("Трекер не запущен, доступна только правка файлов. Остановка: Ctrl+C")
-        try:
-            while True:
-                await asyncio.sleep(1)
-        finally:
-            await runner.cleanup()
-
-    try:
-        asyncio.run(run())
-    except KeyboardInterrupt:
-        pass

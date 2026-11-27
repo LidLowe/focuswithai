@@ -69,29 +69,6 @@ class LiveAudio:
         self.task = asyncio.create_task(self._play(self.queue, rate, current, prelude, on_play))
         return True
 
-    def start_speech(self, response, synthesize, current, prelude, on_play):
-        if self.busy or self.player.busy:
-            return False
-        self.error = None
-        self.response = response
-        self.task = asyncio.create_task(self._speech(synthesize, current, prelude, on_play))
-        return True
-
-    async def _speech(self, synthesize, current, prelude, on_play):
-        try:
-            async with self.player.sequence():
-                if not current():
-                    return
-                data = await asyncio.wait_for(synthesize(), 20)
-                if data and current():
-                    await prelude()
-                    if current():
-                        await self.player.play(io.BytesIO(data[0]), self.volume, on_play)
-        except PlaybackStopped:
-            pass
-        except Exception as error:
-            self.error = type(error).__name__
-
     async def feed_stream(self, response, data):
         # A provider can deliver several seconds of PCM in a single burst.
         while (response == self.response and self.busy and self.queue is not None
@@ -164,4 +141,3 @@ class LiveAudio:
         self.cancel()
         if self.task:
             await asyncio.gather(self.task, return_exceptions=True)
-

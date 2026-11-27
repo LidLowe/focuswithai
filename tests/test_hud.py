@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 if sys.platform == 'win32':
     import win32con
     import win32gui
-    from focus_hud import NativeCard, monitor_work_area
+    from focus_hud import FocusHUD, NativeCard, monitor_work_area
     from startup_tray import MENU, StartupTray
 
 
@@ -41,6 +41,24 @@ class HudTests(unittest.TestCase):
             self.assertFalse(win32gui.IsWindowVisible(card.handle))
         finally:
             card.close()
+
+    def test_hud_reads_the_live_result_and_connection_state(self):
+        with patch('focus_hud.NativeCard') as factory, patch('windows_acquisition.set_capture_exclusion'), \
+                patch('focus_hud.monitor_work_area', return_value=(0, 0, 1920, 1040)), \
+                patch('focus_hud.win32gui.RegisterHotKey'), patch('focus_hud.win32gui.UnregisterHotKey'):
+            hud = FocusHUD({'focus_hud_enabled': True}, Mock())
+            try:
+                hud.update({
+                    'sources': {'armed': False}, 'sprint': None, 'meter_enabled': False,
+                    'activity': 'ON_TASK', 'score': 0, 'level': 'NORMAL', 'task': '',
+                    'live_engine': {'state': 'READY', 'last_success': None,
+                                    'result': {'classification': 'INDIRECTLY_RELATED'}},
+                }, None)
+                content = factory.return_value.show.call_args.args[1]
+                self.assertEqual(content[3], 'Связано с целью')
+                self.assertEqual(content[-2], 'Gemini · READY')
+            finally:
+                hud.close()
 
     def test_tray_menu_builds_and_dispatches_hud_action(self):
         card = NativeCard(Mock(), Mock())

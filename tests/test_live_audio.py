@@ -46,27 +46,16 @@ class AudioTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sink.write.await_count, 8)
         self.assertEqual(audio.dropped, 0)
 
-    async def test_local_tts_only_uses_admitted_text_and_shared_player(self):
-        from tts import Speaker
-        text = 'Следующий шаг для тестового спринта'
-        local = Mock(name='local')
-        local.name = 'sapi'
-        local.synthesize = AsyncMock(return_value=(b'test fixture', 'wav'))
-        network = Mock()
-        network.name = 'edge'
-        network.synthesize = AsyncMock()
-        speaker = Speaker({'tts_engines': []})
-        speaker.engines = [network, local]
+    async def test_audio_without_alarm_plays_native_pcm_on_shared_player(self):
+        sink = Mock(write=AsyncMock(), drain=AsyncMock())
         player = ClipPlayer()
-        player.play = AsyncMock()
-        audio = LiveAudio(player)
-        audio.start_speech('request', lambda: speaker.synthesize(text, local_only=True),
-                           lambda: True, AsyncMock(), Mock())
-        self.assertFalse(audio.feed('request', bytes(200)))
+        audio = LiveAudio(player, sink_factory=lambda rate, level: sink)
+        prompt = bytes(400)
+        audio.start('native', 24000, lambda: True, AsyncMock())
+        self.assertTrue(audio.feed('native', prompt))
+        audio.end('native')
         await audio.task
-        local.synthesize.assert_awaited_once_with(text)
-        network.synthesize.assert_not_awaited()
-        player.play.assert_awaited_once()
+        sink.write.assert_awaited_once_with(prompt)
         self.assertFalse(player.busy)
 
     async def test_cancel_during_alarm_delay_and_native_drain(self):
@@ -84,4 +73,3 @@ class AudioTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(audio.task, 1)
         sink.write.assert_awaited_once_with(bytes(400))
         sink.drain.assert_awaited_once()
-

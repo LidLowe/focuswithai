@@ -1,6 +1,2 @@
-pyobjc
-pygame==2.6.1
-edge-tts>=7.3.1
-aiohttp>=3.9
-discord-rpc==5.1
-piper-tts>=1.8.0
+-r requirements.txt
+pyobjc-framework-Cocoa

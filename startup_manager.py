@@ -8,8 +8,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 STARTUP_DEFAULTS = {
-    'startup_llm_auto': True,
-    'startup_monitor_auto': True,
     'startup_open_dashboard': False,
     'startup_start_minimized': True,
     'startup_delay_seconds': 8,

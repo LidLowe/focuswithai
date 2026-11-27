@@ -8,7 +8,9 @@ from unittest.mock import AsyncMock, Mock
 
 os.environ.setdefault('PYGAME_HIDE_SUPPORT_PROMPT', '1')
 
-from focus_meter import ActivityMonitor, ActivityState as State, DistractionMeter, Foreground, LLMClassifier, Severity
+from focus_meter import ActivityMonitor, ActivityState as State, DistractionMeter, Foreground, Severity
+from focus_runtime import FocusController, Phase
+from voicepack import VoicePackNotifier
 from intervention import ForegroundGuard, InterventionEngine, site_host
 from voicepack import Event
 
@@ -36,50 +38,32 @@ class MeterTests(unittest.TestCase):
 
     def test_activity_window_and_idle_are_independent(self):
         expected = Foreground(7, 1, 'Worksheet - Visual Studio Code', 'Code.exe')
-        monitor = ActivityMonitor(lambda: expected, ['visual studio code'], 20, lambda: 22)
-        self.assertEqual(monitor.sample(), (expected, True, True))
+        monitor = ActivityMonitor(lambda: expected, 20, lambda: 22)
+        self.assertEqual(monitor.sample(), (expected, True))
 
 
-class ClassifierTests(unittest.IsolatedAsyncioTestCase):
-    async def test_empty_browser_titles_remain_uncertain_without_inference(self):
-        client = AsyncMock()
-        classifier = LLMClassifier(client, {})
-        for title in ('Google Chrome', 'Новая вкладка — Microsoft Edge', 'New Tab - Mozilla Firefox'):
-            self.assertEqual(classifier.observe(50, 'Report', Foreground(title=title), False, True)[0], State.UNCERTAIN)
-        client.chat.assert_not_awaited()
-
-    async def test_uncertain_recheck_and_no_stale_window_application(self):
-        client = AsyncMock()
-        client.chat.side_effect = ['{"state":"UNCERTAIN","reason":"Мало сведений"}',
-                                   '{"state":"OFF_TASK","reason":"Окно игры"}']
-        classifier = LLMClassifier(client, {})
+class FocusContextTests(unittest.IsolatedAsyncioTestCase):
+    async def test_browser_without_opted_in_context_stays_uncertain(self):
         now = time.monotonic()
-        game = Foreground(7, 1, 'Game', 'Game.exe')
-        work = Foreground(9, 2, 'Project', 'Work.exe')
-        self.assertEqual(classifier.observe(now, 'Report', game, False, True)[0], State.UNCERTAIN)
-        classifier.observe(now + 2, 'Report', game, False, True)
-        await classifier.job
-        self.assertEqual(classifier.observe(now + 3, 'Report', game, False, True)[0], State.UNCERTAIN)
-        self.assertEqual(client.chat.await_count, 1)
-        classifier.cache.clear()  # Expire the uncertain result without waiting in real time.
-        classifier.observe(now + 30, 'Report', game, False, True)
-        self.assertEqual(classifier.observe(now + 30.1, 'Report', work, True, True)[0], State.ON_TASK)
-        await classifier.job
-        self.assertEqual(classifier.observe(now + 30.2, 'Report', work, True, True)[0], State.ON_TASK)
-        self.assertEqual(classifier.observe(now + 30.3, 'New task', game, False, True)[0], State.UNCERTAIN)
-        await classifier.close()
-
-    async def test_failed_model_holds_unknown_activity_and_rule_mode_is_explicit(self):
-        client = AsyncMock()
-        client.chat.side_effect = RuntimeError('offline')
-        classifier = LLMClassifier(client, {})
-        now, window = time.monotonic(), Foreground(1, 2, 'Browser', 'chrome.exe')
-        classifier.observe(now, 'Paper', window, False, True)
-        classifier.observe(now + 3, 'Paper', window, False, True)
-        await classifier.job
-        self.assertEqual(classifier.observe(now + 4, 'Paper', window, False, True)[0], State.UNCERTAIN)
-        self.assertEqual(classifier.observe(now + 4, 'Paper', window, False, False)[0], State.OFF_TASK)
-        await classifier.close()
+        browser = Foreground(7, 1, 'New Tab - Chrome', 'chrome.exe')
+        phase = Phase(('s1', 1), 'Report', True, True, False, {'id': 's1', 'state': 'ACTIVE'}, '{"goal":"Report"}')
+        transport = Mock()
+        config = {'focus_meter_enabled': True}
+        tracker = FocusController(config, lambda: phase, lambda: True, Mock(), Mock(), Mock(),
+                                  notifier=VoicePackNotifier(config), sound_enabled=lambda: True,
+                                  get_window=lambda: browser, transport_factory=transport)
+        tracker.monitor.get_idle = lambda: 0
+        try:
+            tracker._tick(now)
+            tracker._tick(now + 3)
+            self.assertIs(tracker.state, State.UNCERTAIN)
+            self.assertEqual(tracker.meter.score, 0)
+            transport.assert_not_called()
+        finally:
+            if tracker.hud:
+                tracker.hud.close()
+            if tracker.intervention:
+                tracker.intervention.guard.close()
 
 
 class InterventionTests(unittest.IsolatedAsyncioTestCase):

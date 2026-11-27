@@ -4,7 +4,7 @@ import time
 from activity_context import clean
 from commentary import CommentaryGate
 from live_audio import LiveAudio
-from live_backends import live_factory
+from gemini_live import DEFAULTS, GeminiLiveTransport
 from live_session import LiveSession, number
 from voicepack import Event
 
@@ -14,14 +14,14 @@ ALARMS = dict(START=Event.SESSION_START, DEVIATION=Event.DISTRACTION, NEXT_STEP=
 
 
 class LiveFocus:
-    def __init__(self, config, owner, notifier, sound_enabled):
+    def __init__(self, config, owner, notifier, sound_enabled, *, transport_factory=None):
         self.owner, self.notifier, self.sound_enabled = owner, notifier, sound_enabled
-        volume = notifier.level if notifier.mode in ('tts', 'alarm_tts') else number(config, 'live_volume', .55, 0, 1)
+        volume = number(config, 'live_volume', .55, 0, 1)
         self.audio = LiveAudio(notifier.player, volume)
-        self.session = LiveSession(config, self.output, self.audio.cancel, live_factory(config))
+        self.session = LiveSession({**DEFAULTS, **config}, self.output, self.audio.cancel,
+                                   transport_factory or (lambda: GeminiLiveTransport(config)))
         self.gate = CommentaryGate(config, number(config, 'focus_cooldown_seconds', 45, 15, 300))
-        self.cloud = config.get('activity_provider_mode') == 'gemini_live'
-        self.allow_images = not self.cloud or config.get('activity_send_remote_images') is True
+        self.allow_images = config.get('activity_send_remote_images') is True
         self.focus_audio = config.get('focus_audio', True)
 
         self.next_start = 'SPRINT_STARTED'
@@ -34,7 +34,7 @@ class LiveFocus:
 
     def request(self, kind):
         if not self.sound_allowed():
-            raise ValueError('Включи звук фокуса и выбери Live Audio либо TTS в разделе Live Engine.')
+            raise ValueError('Включи звук фокуса и выбери Live Audio в разделе Live Engine.')
         self.pending_request = kind, time.monotonic() + 60
 
     def current(self, stamp):
@@ -49,7 +49,7 @@ class LiveFocus:
 
     def sound_allowed(self):
         return (self.sound_enabled() and self.focus_audio and self.audio.volume > 0
-                and self.notifier.mode in ('alarm_live', 'live', 'tts', 'alarm_tts')
+                and self.notifier.mode in ('alarm_live', 'live')
                 and not (self.owner.intervention and self.owner.intervention.silenced))
 
     def sample(self, now, phase, key, facts, frame):
@@ -58,6 +58,10 @@ class LiveFocus:
         if not session.task:
             session.start(phase.sprint['id'], facts['sprint'], self.next_start)
             self.next_start = 'SPRINT_UPDATED'
+        facts['recent_warnings'] = [
+            {'kind': kind, 'seconds_ago': round(now - at)}
+            for at, kind in self.gate.warnings if now - at < 180
+        ]
         session.observe(facts, frame if self.allow_images else None, key, now)
         if self.pending_request:
             kind, expires = self.pending_request
@@ -81,9 +85,7 @@ class LiveFocus:
             if self.audio.response == response:
                 self.audio.cancel()
         elif msg.kind == 'AUDIO':
-            if self.cloud:
-                return self.audio.feed_stream(response, msg.data)
-            self.audio.feed(response, msg.data)
+            return self.audio.feed_stream(response, msg.data)
         elif msg.kind == 'END':
             self.audio.end(response)
         elif msg.kind == 'COMMENTARY':
@@ -110,6 +112,7 @@ class LiveFocus:
                 def started():
                     session.state = 'SPEAKING'
                     session.last_comment = line
+                    self.gate.record(time.monotonic(), kind)
                     if self.owner.on_intervention:
                         self.owner.on_intervention()
 
@@ -120,13 +123,8 @@ class LiveFocus:
                 async def prelude():
                     await self.notifier.live_alarm(event)
 
-                if self.notifier.mode in ('tts', 'alarm_tts'):
-                    self.audio.start_speech(response, lambda: self.notifier.speaker.synthesize(line, local_only=True),
-                                           current, prelude, started)
-                else:
-                    self.audio.start(response, data.get('rate'), current, prelude, started)
+                self.audio.start(response, data.get('rate'), current, prelude, started)
 
     def diagnostics(self):
         return {**self.session.diagnostics(), 'buffer_bytes': self.audio.buffered,
                 'audio_dropped': self.audio.dropped, 'audio_error': self.audio.error}
-

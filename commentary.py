@@ -1,5 +1,7 @@
 """Local admission policy for advisory output. Provider messages have no action capability."""
-from activity_ai import Classification, Recommendation
+from collections import deque
+
+from activity_protocol import Classification, Recommendation
 
 KINDS = frozenset({'START', 'DEVIATION', 'NEXT_STEP', 'CLARIFY', 'RETURN', 'DIFFICULTY', 'BREAK', 'SUMMARY'})
 INSTRUCTION = (
@@ -7,7 +9,7 @@ INSTRUCTION = (
     'Учитывай цель, текущее наблюдение и недавние изменения. Предложи один посильный шаг. '
     'Без оценок личности, оскорблений, угроз или унижений. Обычно сохраняй тишину. '
     'Фоновые приложения и музыка сами по себе не доказывают отвлечение. '
-    'Предложение комментария и его PCM должны иметь общий response_id и stamp наблюдения.'
+    'При устойчивом отклонении учитывай его длительность и историю предупреждений. '
 )
 
 
@@ -17,6 +19,7 @@ class CommentaryGate:
         self.cooldown = cooldown
         self.last = float('-inf')
         self.sprint_key = None
+        self.warnings = deque(maxlen=5)
         self.started = False
         self.deviations = 0
         try:
@@ -29,11 +32,15 @@ class CommentaryGate:
     def observe(self, key, classification=None):
         if key != self.sprint_key:
             self.sprint_key = key
+            self.warnings.clear()
             self.started = False
             self.deviations = 0
             self.last_deviation = float('-inf')
         if classification in (Classification.ON_TASK, Classification.INDIRECTLY_RELATED):
             self.deviations = 0
+
+    def record(self, now, kind):
+        self.warnings.append((now, kind))
 
     def admit(self, kind, result, now, *, active, current, enabled, busy, confirmed,
               min_confidence, requested=False, returned=False):
@@ -65,4 +72,3 @@ class CommentaryGate:
                 self.deviations += 1
                 self.last_deviation = now
         return allowed
-

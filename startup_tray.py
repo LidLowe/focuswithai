@@ -36,9 +36,9 @@ class StartupTray:
             raise
         self.update(*self.status)
 
-    def update(self, state, backend, llm):
+    def update(self, state, backend, live):
         ready = state in ('ready', 'limited', 'paused')
-        value = state, backend, llm
+        value = state, backend, live
         self.ready = ready
         if self.added and self.status == value:
             return
@@ -46,7 +46,7 @@ class StartupTray:
         icons = {'ready': win32con.IDI_INFORMATION, 'limited': win32con.IDI_WARNING,
                  'error': win32con.IDI_ERROR, 'paused': win32con.IDI_APPLICATION, 'loading': win32con.IDI_APPLICATION}
         flags = win32gui.NIF_ICON | win32gui.NIF_MESSAGE | win32gui.NIF_TIP
-        title = f'FocusWithAI · {backend} · LLM: {llm}'[:63]
+        title = f'FocusWithAI · {backend} · Gemini: {live}'[:63]
         data = (self.handle, 0, flags, MESSAGE, win32gui.LoadIcon(0, icons[state]), title)
         try:
             win32gui.Shell_NotifyIcon(win32gui.NIM_MODIFY if self.added else win32gui.NIM_ADD, data)

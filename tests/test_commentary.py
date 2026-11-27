@@ -3,13 +3,14 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
-from activity_ai import Classification, Recommendation, Result
+from activity_protocol import Classification, Recommendation, Result
 from commentary import CommentaryGate
 from decision import DecisionEngine
 from focus_meter import ActivityState, Foreground
 from live_focus import LiveFocus
 from test_context_stream import facts
 from test_live_session import until
+from mock_live import MockLiveTransport
 from voicepack import Event, VoicePackNotifier
 
 
@@ -43,10 +44,10 @@ class GateTests(unittest.TestCase):
 
 class ChainTests(unittest.IsolatedAsyncioTestCase):
     async def test_stream_decision_alarm_then_pcm(self):
-        cfg = {'activity_provider_mode': 'live_mock', 'live_proactive': True,
+        cfg = {'live_proactive': True,
                'notification_mode': 'alarm_live', 'alarm_voice_delay_ms': 100,
                'live_analysis_seconds': 2, 'activity_confirmation_seconds': 2}
-        notifier = VoicePackNotifier(cfg, AsyncMock(), AsyncMock())
+        notifier = VoicePackNotifier(cfg)
         calls = []
         async def alarm(*args, **kwargs):
             calls.append(('alarm', time.monotonic(), args[1]))
@@ -58,7 +59,7 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
         owner = SimpleNamespace(phase=lambda: phase, phase_key=phase.key, signature=signature,
             use_ai=lambda: True, acquisition=SimpleNamespace(context=SimpleNamespace(window=win, browser=None),
             foreground_is_current=lambda: True), decision=DecisionEngine(cfg), intervention=None, on_intervention=Mock())
-        live = LiveFocus(cfg, owner, notifier, lambda: True)
+        live = LiveFocus(cfg, owner, notifier, lambda: True, transport_factory=MockLiveTransport)
         self.addAsyncCleanup(live.audio.close)
         self.addAsyncCleanup(live.session.close)
         sink = Mock(write=AsyncMock(side_effect=lambda _: calls.append(('pcm', time.monotonic(), None))),
@@ -79,18 +80,7 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[1][0], 'pcm')
         self.assertGreaterEqual(calls[1][1] - calls[0][1], .075)
         self.assertIn(data['sprint']['goal'], live.session.last_comment)
-        notifier.speaker.synthesize.assert_not_awaited()
         owner.on_intervention.assert_called_once()
         phase.active = False
         live.stop('SPRINT_PAUSED', True)
         self.assertEqual(live.session.state, 'PAUSED')
-
-    async def test_mock_startup_does_not_probe_or_start_model(self):
-        from launcher import StartupOrchestrator, local_endpoint
-        cfg = {'activity_provider_mode': 'live_mock', 'startup_llm_auto': True}
-        self.assertIsNone(local_endpoint(cfg))
-        service = SimpleNamespace(config=cfg, endpoint=None, session=None, _launch_llm=Mock())
-        service.probe_llm = lambda: StartupOrchestrator.probe_llm(service)
-        await StartupOrchestrator.ensure_llm(service)
-        service._launch_llm.assert_not_called()
-

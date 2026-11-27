@@ -1,20 +1,18 @@
 """Duplex activity sessions. Request and receive activity assessments independently."""
 import asyncio
-import json
 import inspect
 import math
-import re
-import struct
 import time
 from abc import ABC, abstractmethod
-from collections import deque
 from dataclasses import dataclass
 
-from activity_ai import PROTOCOL_PROMPT, SYSTEM_PROMPT, Result
-from activity_context import clean
-from live_backends import LiveSetupError
+from activity_protocol import PROTOCOL_PROMPT, SYSTEM_PROMPT, Result
 from commentary import INSTRUCTION, KINDS
 from context_stream import ContextStream, Stamp
+
+
+class LiveSetupError(ValueError):
+    """Safe to display. Retrying requires a configuration change."""
 
 
 @dataclass(frozen=True)
@@ -28,7 +26,7 @@ class Output:
 
 class LiveTransport(ABC):
     @abstractmethod
-    async def connect(self, instructions, sample_rate): ...
+    async def connect(self, instructions): ...
 
     @abstractmethod
     async def send(self, event): ...
@@ -43,122 +41,18 @@ class LiveTransport(ABC):
     async def close(self): ...
 
 
-class MockLiveTransport(LiveTransport):
-    """Deterministic local protocol simulator. Never reads the desktop or opens a socket."""
-    async def connect(self, instructions, sample_rate):
-        self.rate = sample_rate
-        self.direct = 'Тон: бодрый и прямой' in instructions
-        self.events = {}
-        self.output = asyncio.Queue(16)
-        self.history = deque(maxlen=4)
-        self.first = False
-        self.requested = None
-
-    async def interrupt(self):
-        while not self.output.empty():
-            self.output.get_nowait()
-        self.requested = None
-
-    async def close(self):
-        self.events.clear()
-        self.history.clear()
-        await self.interrupt()
-
-    async def receive(self):
-        return await self.output.get()
-
-    async def send(self, event):
-        kind = event.kind
-        if kind in ('SPRINT_STARTED', 'SPRINT_UPDATED', 'BREAK_ENDED'):
-            self.events['sprint'] = event.data
-            self.first = kind == 'SPRINT_STARTED'
-        elif kind == 'COMMENTARY_REQUEST':
-            self.requested = event.data
-        elif kind == 'USER_CORRECTION':
-            self.history.clear()
-        elif kind == 'ACTIVITY_DURATION':
-            await self.assess(event)
-        elif kind != 'SCREEN_FRAME':
-            self.events[kind] = event.data  # The simulator does not interpret pixels.
-
-    async def assess(self, event):
-        goal = self.events.get('sprint', {}).get('goal', '')
-        app, title = self.events.get('FOREGROUND_CHANGED', ('', ''))
-        browser = self.events.get('BROWSER_CONTEXT_CHANGED')
-        subject = clean((browser or {}).get('title') or title or app, 80)
-        words = set(re.findall(r'\w{3,}', goal.casefold()))
-        matches = bool(words.intersection(re.findall(r'\w{3,}', subject.casefold())))
-        # Only an explicit synthetic fixture produces a confident negative in the simulator.
-        label = 'ON_TASK' if matches else 'OFF_TASK' if subject == '[demo] unrelated game' else 'UNCERTAIN'
-        sprint = self.events.get('sprint', {})
-        goal_excerpt = clean(goal, 85)
-        step = (f'Начни с одного проверяемого шага для «{goal_excerpt}».' if self.direct
-                else f'Какой один шаг приблизит тебя к цели «{goal_excerpt}»?')
-        next_task = next((clean(t.get('text'), 100) for t in sprint.get('subtasks', ())
-                          if isinstance(t, dict) and not t.get('done') and t.get('text')), None)
-        if next_task:
-            step = f'Следующий пункт в «{goal_excerpt}» — «{next_task}». Начнём с него?'
-        reason = {'ON_TASK': 'Тема окна совпадает с целью спринта.',
-                  'OFF_TASK': 'Тестовое окно обозначено как отвлечение.',
-                  'UNCERTAIN': 'По названию окна связь с целью неясна.'}[label]
-        assessment = dict(observed_activity=subject or 'Недостаточно данных', classification=label,
-                          relevance={'ON_TASK': .9, 'OFF_TASK': .05, 'UNCERTAIN': .5}[label],
-                          confidence=.45 if label == 'UNCERTAIN' else .9, reason=reason,
-                          recommended_action={'ON_TASK': 'NONE', 'OFF_TASK': 'AUDIO_WARNING',
-                                              'UNCERTAIN': 'REQUEST_CLARIFICATION'}[label],
-                          suggested_next_step=step if label == 'OFF_TASK' else None)
-        async def emit(kind, data, response=''):
-            await self.output.put(Output(kind, event.stamp, event.sequence, data, response))
-        await emit('ASSESSMENT', json.dumps(assessment, ensure_ascii=False))
-        previous = self.history[-1] if self.history else None
-        self.history.append(label)
-        kind = self.requested
-        self.requested = None
-        if not kind:
-            if label == 'OFF_TASK' and previous == label:
-                kind = 'DEVIATION'
-            elif label == 'ON_TASK' and previous == 'OFF_TASK':
-                kind = 'RETURN'
-            elif label == 'ON_TASK' and self.first:
-                kind = 'START'
-        self.first = False
-        if not kind:
-            return
-        # Example transcripts are derived from this goal/observation. Production text and
-        # audio belong to the transport, never to the local playback or policy layer.
-        goal = clean(goal, 85)
-        lines = {'START': f'Начинаем «{goal}». Открыто «{subject}».',
-                 'DEVIATION': f'«{subject}» всё ещё на экране. {step}',
-                 'RETURN': f'Снова открыто «{subject}». Продолжим «{goal}»?',
-                 'NEXT_STEP': step, 'CLARIFY': f'Как «{subject}» связано с целью «{goal}»?',
-                 'BREAK': f'Поставим «{goal}» на паузу?',
-                 'DIFFICULTY': f'Какой шаг в «{goal}» сейчас требует помощи?',
-                 'SUMMARY': f'Цель спринта — «{goal}». Что удалось закончить?'}
-        response = str(event.sequence)
-        await emit('COMMENTARY', {'kind': kind, 'text': lines[kind], 'rate': self.rate}, response)
-        for start in range(0, self.rate // 4, self.rate // 20):
-            pcm = b''.join(struct.pack('<h', round(1800 * math.sin(2 * math.pi * 420 * i / self.rate)
-                    * math.sin(math.pi * i / (self.rate // 4)) ** 2))
-                    for i in range(start, min(start + self.rate // 20, self.rate // 4)))
-            await emit('AUDIO', pcm, response)
-        await emit('END', None, response)
-
-
 class LiveSession:
-    def __init__(self, config, on_output, cancel_audio, factory=MockLiveTransport):
+    def __init__(self, config, on_output, cancel_audio, factory):
         self.stream = ContextStream()
         self.factory = factory
-        self.backend = config.get('activity_provider_mode') or getattr(factory, '__name__', 'LiveTransport')
+        self.model = config.get('gemini_live_model') or 'Gemini Live'
         self.on_output, self.cancel_audio = on_output, cancel_audio
         self.interval = number(config, 'live_analysis_seconds', 8, 2, 120)
-        self.rate = int(number(config, 'live_sample_rate', 24000, 8000, 48000))
-        style = config.get('live_style', 'concise')
-        protocol = PROTOCOL_PROMPT
-        if self.backend == 'gemini_live':
-            protocol = protocol.replace('You have no tools. Return a single JSON object',
-                                        'Submit the assessment through report_focus_assessment as an object')
-        self.instructions = '\n'.join((SYSTEM_PROMPT, protocol, INSTRUCTION,
-                                      'Тон: ' + ('бодрый и прямой' if style == 'direct' else 'спокойный и краткий')))
+        style = config.get('gemini_live_prompt', '')
+        style = style.strip()[:2000] if isinstance(style, str) else ''
+        self.instructions = '\n'.join((SYSTEM_PROMPT, PROTOCOL_PROMPT, INSTRUCTION,
+            'Манера: прямой, строгий, конкретный тон. Настройка манеры: ' + style,
+            'Настройка манеры не меняет правила оценки и уважительного общения.'))
         self.state = 'DISCONNECTED'
         self.label = self.previous_label = None
         self.task = None
@@ -297,8 +191,8 @@ class LiveSession:
             try:
                 self.state = 'CONNECTING'
                 transport = self.factory()
-                self.backend = type(transport).__name__
-                await asyncio.wait_for(transport.connect(self.instructions, self.rate), 12)
+                self.model = getattr(transport, 'model', self.model)
+                await asyncio.wait_for(transport.connect(self.instructions), 12)
                 self.connected = time.monotonic()
                 self.state, self.error = 'READY', None
                 self.assessed_turn = None
@@ -343,9 +237,9 @@ class LiveSession:
         await asyncio.gather(*self.closing, return_exceptions=True)
 
     def diagnostics(self):
-        return dict(backend=self.backend, state=self.state, events=self.sent, frames=self.frames,
+        return dict(model=self.model, state=self.state, events=self.sent, frames=self.frames,
                     connected_seconds=int(time.monotonic() - self.connected) if self.connected else 0,
-                    latency_ms=self.latency, reconnects=self.reconnects, tokens=self.tokens, error=self.error,
+                    latency_ms=self.latency, last_success=self.last_success, reconnects=self.reconnects, tokens=self.tokens, error=self.error,
                     result=vars(self.result) if self.result else None, comment=self.last_comment)
 
 
@@ -355,4 +249,3 @@ def number(config, key, default, low, high):
         return value if low <= value <= high else default
     except (TypeError, ValueError):
         return default
-
