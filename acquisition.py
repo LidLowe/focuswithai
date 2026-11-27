@@ -6,7 +6,7 @@ import ntpath
 import threading
 import time
 
-from activity_context import BROWSERS, ContextAggregator, Privacy, clean, setting
+from activity_context import BROWSERS, ContextAggregator, Privacy, clean, items, setting
 
 
 def background(function, *args):
@@ -52,11 +52,19 @@ class Acquisition:
         self.capture_error = None
         self.media_error = None
         self.apps = []
+        self.allowed_apps = set(items(config, 'context_allowed_apps'))
+        self.capture_backoff = 1
         self.active = False
 
-    def arm(self):
+    def arm(self, selection):
         if not self.active or not self.enabled or not self.has_capture or not self.privacy.capture_apps:
             raise ValueError('Нужны активный спринт, Pillow и разрешённый полный путь к рабочему приложению.')
+        candidates = self.windows.capture_choices(self.privacy)
+        choice = next((w for w in candidates if w['id'] == selection), None)
+        if not choice:
+            raise ValueError('Выбери доступное разрешённое рабочее окно.')
+        self.stop_capture()
+        self.selected = (choice['handle'], choice['pid'])
         self.armed = True
         self.next_capture = time.monotonic() + 2
         self.capture_error = None
@@ -69,6 +77,9 @@ class Acquisition:
 
     def suspend(self):
         self.active = False
+        if self.apps_job:
+            self.apps_job.cancel()
+            self.apps_job = None
         self.stop_capture()
         self.context.reset()
         if self.media_job:
@@ -105,11 +116,14 @@ class Acquisition:
         if switched and self.armed and self.selected and (window.handle, window.pid) != self.selected:
             self.capture_epoch += 1
         self.context.sample(now, window)
+        if switched:
+            self.capture_backoff = 1
         if self.apps_job and self.apps_job.done():
             value, _ = self.apps_job.result()
             self.apps_job = None
             if value is not None:
                 self.apps = [name for name in value if name.casefold() not in self.privacy.apps]
+                self.context.user_apps = [clean(n, 80) for n in self.apps if n.casefold() in self.allowed_apps][:32]
         if self.windows and not self.apps_job and now >= self.next_apps:
             self.next_apps = now + 20
             self.apps_job = background(self.windows.user_apps)
@@ -132,16 +146,20 @@ class Acquisition:
                 self.capture_error = error or (None if value else 'window_unavailable')
                 if value and value.differs(self.context.frame):
                     self.context.frame = value
-                elif not value:
+                    self.capture_backoff = 1
+                else:
+                    self.capture_backoff = min(4, self.capture_backoff * 2)
+                if not value:
                     self.context.frame = None
         if idle or not self.armed or not self.privacy.capture_allowed(window):
             return
         if self.selected is None:
-            self.selected = (window.handle, window.pid)
+            return
         if self.selected != (window.handle, window.pid) or self.capture_job or now < self.next_capture:
             return
         self.job_window, self.job_epoch = window, self.capture_epoch
-        self.next_capture = now + (self.interval if self.mode == 'periodic' else min(self.interval, 5))
+        self.next_capture = now + (self.interval if self.mode == 'periodic'
+                                   else min(120, self.interval * self.capture_backoff))
         self.capture_job = background(self.windows.capture_window, window, self.dimensions, self.quality)
 
     def foreground_is_current(self):

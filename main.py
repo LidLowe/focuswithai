@@ -16,6 +16,7 @@
 # Этот проект использует библиотеки, лицензированные под MIT, BSD и LGPL лицензиями.
 # ---------------------------------------------------------------
 
+import io
 import os
 import sys
 import signal
@@ -58,7 +59,7 @@ from config_store import load_config
 from focus_meter import Foreground
 from focus_runtime import FocusController, Phase
 from sprints import SprintManager
-from voicepack import Event, OBSERVATIONS, VoicePackNotifier, notification_mode
+from voicepack import ClipPlayer, Event, OBSERVATIONS, VoicePackNotifier, notification_mode
 
 # Вывод копируется в буфер, чтобы панель могла показать логи
 panel.capture_output()
@@ -118,8 +119,13 @@ def portable_foreground():
 # Озвучивание: цепочка движков edge -> piper -> sapi (см. tts.py)
 speaker = Speaker(config)
 
+audio_coordinator = ClipPlayer()
+
 async def speak_text(text):
-    await speaker.speak(text)
+    async with audio_coordinator.sequence():
+        audio = await speaker.synthesize(text)
+        if audio:
+            await audio_coordinator.play(io.BytesIO(audio[0]), 1.0)
 
 # AI ассистент: промпты, контекст, память диалога и озвучивание ответов
 assistant = FocusAssistant(ai_client, config, speak_text)
@@ -201,7 +207,7 @@ class Runtime:
         event_config = config
         if not notification_mode(config):
             event_config = {**config, 'notification_mode': 'tts'}
-        self.voicepack = VoicePackNotifier(event_config, ai_client, speaker)
+        self.voicepack = VoicePackNotifier(event_config, ai_client, speaker, player=audio_coordinator)
         self.focus = None
         self.startup_managed = os.environ.get('FOCUSWITHAI_MANAGED') == '1'
         self.startup_ready = False
@@ -215,6 +221,7 @@ class Runtime:
             config, self.focus_phase, lambda: ai_on,
             self.play_focus_event, self.stop_audio, lambda: self.control('start_break'),
             observe=self.sprints.observe, on_intervention=self.sprints.intervention,
+            notifier=self.voicepack, sound_enabled=lambda: sound_on,
             get_window=None if sys.platform == 'win32' else portable_foreground,
         )
 
@@ -263,12 +270,16 @@ class Runtime:
                      sprint['state'] == 'PAUSED', sprint, self.sprints.llm_context)
 
     def play_focus_event(self, event, task, reason, mode, on_play=None):
+        if self.focus and self.focus.live and self.voicepack.mode in ('live', 'alarm_live', 'tts', 'alarm_tts'):
+            return False  # The locally admitted live proposal owns the complete sequence.
         if self.voicepack and sound_on and self.focus_phase().active:
             return self.voicepack.notify(event, {'observation': reason or OBSERVATIONS[event], 'task': task},
                                          use_ai=False, mode_override=mode, on_play=on_play)
         return False
 
     def stop_audio(self):
+        if self.focus and self.focus.live:
+            self.focus.live.audio.cancel()
         if self.voicepack:
             self.voicepack.stop_audio()
 
@@ -276,10 +287,20 @@ class Runtime:
         before = self.focus_phase()
         item = self.sprints.command(action, body, at=at)
         after = self.focus_phase()
-        if before.key != after.key or (before.sprint and before.sprint['state'] == 'ACTIVE' and not after.active):
+        if (before.key != after.key or before.context != after.context
+                or (before.sprint and before.sprint['state'] == 'ACTIVE' and not after.active)):
             self.stop_audio()
             if self.focus:
-                self.focus.suspend()
+                terminal = {'break': 'BREAK_STARTED', 'pause': 'SPRINT_PAUSED', 'complete': 'SPRINT_COMPLETED',
+                            'cancel': 'SPRINT_COMPLETED'}.get(action)
+                self.focus.suspend(terminal, paused=bool(after.sprint and after.sprint['state'] in ('PAUSED', 'BREAK')))
+                if self.focus.live and after.active:
+                    if not before.sprint or before.sprint['id'] != after.sprint['id']:
+                        self.focus.live.next_start = 'SPRINT_STARTED'
+                    elif before.sprint['state'] == 'BREAK':
+                        self.focus.live.next_start = 'BREAK_ENDED'
+                    elif before.sprint and before.sprint['id'] == after.sprint['id']:
+                        self.focus.live.next_start = 'SPRINT_UPDATED'
                 if before.key != after.key:
                     self.focus.meter.reset(time.monotonic())
         if before.active != after.active or (before.sprint and not after.sprint):
@@ -324,9 +345,9 @@ class Runtime:
                 self.stop_audio()
         elif isinstance(action, str) and action.startswith('focus_'):
             if not self.focus or action[6:] not in ('disable', 'enable', 'hud', 'arm', 'release',
-                                                    'capture_start', 'capture_stop', 'correct'):
+                                                    'capture_start', 'capture_stop', 'correct', 'commentary'):
                 raise ValueError('HUD и вмешательства доступны в Windows.')
-            self.focus.action(action[6:])
+            self.focus.action(action[6:], value)
         elif action in ('task_completed', 'attention'):
             phase = self.focus_phase()
             if not phase.active or not self.voicepack:

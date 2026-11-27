@@ -240,6 +240,8 @@ class FocusHUD:
             ai = state['ai']
             health = {'ready': 'AI готов', 'analyzing': 'AI анализирует', 'unavailable': 'AI недоступен',
                       'rate_limited': 'Лимит AI', 'disabled': 'AI выключен'}.get(ai['status'], 'AI ожидает')
+            if state.get('live_engine'):
+                health = 'Live · ' + state['live_engine']['state']
             stamp = time.strftime('%H:%M:%S', time.localtime(ai['last_success'])) if ai['last_success'] else ''
             footer = 'Захват окна · Ctrl+Shift+F9' if recording else ' '.join(filter(None, (health, stamp)))
             content = (state['score'], state['level'], label, activity,

@@ -248,9 +248,11 @@ class Speaker:
                 self.disabled_until[engine.name] = time.time() + self.cooldown
                 logging.error(f"[TTS] Не удалось подготовить {engine.name}: {e!r}"[:400])
 
-    async def synthesize(self, text: str) -> Optional[Audio]:
+    async def synthesize(self, text: str, *, local_only=False) -> Optional[Audio]:
         now = time.time()
         for engine in self.engines:
+            if local_only and engine.name == 'edge':
+                continue
             if self.disabled_until.get(engine.name, 0) > now:
                 continue
             try:

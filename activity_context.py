@@ -22,6 +22,12 @@ CONTEXT_DEFAULTS = {
     'capture_height': 480,
     'capture_quality': 72,
     'activity_provider_mode': 'request',
+    'live_analysis_seconds': 8,
+    'live_sample_rate': 24000,
+    'live_volume': .55,
+    'live_proactive': False,
+    'live_style': 'concise',
+    'context_allowed_apps': [],
     'activity_provider_vision': False,
     'activity_allow_remote': False,
     'activity_send_remote_images': False,
@@ -42,7 +48,7 @@ PRIVATE_TEXT = re.compile(
     r'private browsing|incognito|inprivate|credentials?|inbox|webmail|direct messages?|'
     r'парол\w*|банк\w*|плат[её]ж\w*|авторизаци\w*|вход|инкогнито|переписк\w*)\b', re.I,
 )
-SECRET = re.compile(r'\b(?:sk-[a-zA-Z0-9_-]{12,}|AIza[\w-]{30,}|gh[pousr]_[\w]{20,}|'
+SECRET = re.compile(r'\b(?:sk-[a-zA-Z0-9_-]{12,}|AIza[\w-]{30,}|AQ\.[\w-]{20,}|gh[pousr]_[\w]{20,}|'
                     r'eyJ[\w-]+\.eyJ[\w-]+\.[\w-]+|(?:api[_ -]?key|token|secret|password)'
                     r'\s*[:=]\s*[^\s,;]+)', re.I)
 DOMAIN = re.compile(r'(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}')
@@ -127,6 +133,7 @@ class ContextAggregator:
         self.sent_frame = None
         self.browser = None
         self.media = None
+        self.user_apps = []
 
     def sample(self, now, window):
         if window != self.window:
@@ -157,7 +164,7 @@ class ContextAggregator:
                        for key, value in sprint_data.items()},
             'application': clean(app), 'window_title': clean(window.title) if app.casefold() not in BROWSERS else '',
             'activity_seconds': round(now - self.entered),
-            'browser': browser, 'media': media,
+            'browser': browser, 'media': media, 'user_apps': self.user_apps,
             'recent_switches': [{'app': name, 'seconds': duration, 'ago': round(now - at)}
                                 for at, name, duration in list(self.switches)[-5:] if now - at < 120],
             'recent_classifications': [{'class': label, 'confidence': confidence, 'ago': round(now - at)}

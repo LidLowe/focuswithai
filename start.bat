@@ -29,6 +29,11 @@ if not exist ".venv\Scripts\python.exe" (
     ".venv\Scripts\python.exe" -m pip install -r requirements.txt
 )
 
+if exist "config.json" (
+    ".venv\Scripts\python.exe" -c "import json,sys; from live_backends import live_factory; sys.exit(0 if live_factory(json.load(open('config.json',encoding='utf-8-sig'))) else 1)"
+    if not errorlevel 1 goto :startup_manager
+)
+
 rem --- Silero: основной офлайн-голос. Нужен PyTorch, ставим CPU-сборку (~500 МБ),
 rem --- а не CUDA (~2.5 ГБ): видеокарта остаётся под LLM, а на CPU Silero и так быстрый
 if not exist ".venv\Lib\site-packages\torch" (

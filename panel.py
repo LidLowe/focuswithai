@@ -435,6 +435,7 @@ class Panel:
         r.add_get('/', self.index)
         r.add_static('/static/', WEB_DIR)
         r.add_get('/api/status', self.status)
+        r.add_get('/api/activity/windows', self.capture_choices)
         r.add_get('/api/activity/preview', self.context_preview)
         r.add_post('/api/activity/preview', self.context_preview)
         r.add_post('/api/activity/browser', self.browser_event)
@@ -466,6 +467,7 @@ class Panel:
         r.add_post('/api/test/tts', self.test_tts)
         r.add_post('/api/test/sound', self.test_sound)
         r.add_post('/api/test/ai', self.test_ai)
+        r.add_post('/api/test/gemini-live', self.test_gemini_live)
         r.add_post('/api/test/reply', self.test_reply)
         r.add_post('/api/models', self.models)
         r.add_post('/api/control', self.control)
@@ -558,6 +560,14 @@ class Panel:
         body = await self._body(request)
         self._live().control(body.get('action'), body.get('value'))
         return _json({'ok': True})
+
+    @_handler
+    async def capture_choices(self, request):
+        focus = self._live().focus
+        if not focus or not focus.phase().active or not focus.acquisition.enabled:
+            return _json({'windows': []})
+        acq = focus.acquisition
+        return _json({'windows': await asyncio.to_thread(acq.windows.capture_choices, acq.privacy)})
 
     @_handler
     async def context_preview(self, request):
@@ -863,7 +873,7 @@ class Panel:
     @_handler
     async def audio_stop(self, request):
         if self.rt and self.rt.voicepack:
-            self.rt.voicepack.stop_audio()
+            self.rt.stop_audio()
         else:
             import pygame
             self._player.stop()
@@ -940,6 +950,21 @@ class Panel:
             data = f.read()
         await self._play_preview(data, float(config.get('reminder_volume', 1.0)))
         return _json({'ok': True})
+
+    @_handler
+    async def test_gemini_live(self, request):
+        from gemini_live import MODEL
+        from live_backends import LiveSetupError, gemini_transport
+        transport = gemini_transport(self._draft(await self._body(request)))
+        try:
+            await asyncio.wait_for(transport.connect('Connection check.', 24000), 12)
+            return _json({'model': MODEL, 'ok': True})
+        except LiveSetupError:
+            raise
+        except Exception as error:
+            return _json({'error': f'Нет соединения с Gemini ({type(error).__name__}).'}, 502)
+        finally:
+            await transport.close()
 
     @_handler
     async def test_ai(self, request):

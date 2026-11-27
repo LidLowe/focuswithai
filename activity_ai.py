@@ -41,7 +41,7 @@ SYSTEM_PROMPT = (
     'planning and tool setup can support the goal. Judge what the resource is being used for, not its category. '
     'Use recent activity and duration. Reserve confidence above 0.8 for strong evidence, for example a game '
     'explicitly named in the foreground during unrelated work. Use low confidence if purpose is unclear. '
-    'Background music/video alone is not a distraction. Reading, thinking, '
+    'Background applications or music/video alone are not a distraction. Reading, thinking, '
     'and lack of input alone are not distractions. Choose UNCERTAIN when evidence is insufficient. '
     'For sustained clear distraction, suggest one concrete next step toward the goal. No psychological diagnosis, '
     'personality judgments, insults or moral judgments. Respond in Russian for the text fields.'

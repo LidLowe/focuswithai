@@ -16,6 +16,7 @@ import aiohttp
 
 from startup_manager import ROOT, STARTUP_DEFAULTS, startup_delay
 from config_store import load_config as load_settings
+from live_backends import live_factory
 
 
 RUNTIME = ROOT / '.runtime'
@@ -30,6 +31,8 @@ def load_config(root):
 
 
 def local_endpoint(config):
+    if live_factory(config):
+        return None
     provider = config.get('ai_provider', 'llama')
     if provider == 'openai':
         url = config.get('openai_base_url', '').rstrip('/')
@@ -269,6 +272,15 @@ class StartupOrchestrator:
             await self.wait(.2 if self.tray.added else 1)
 
     async def probe_llm(self):
+        if self.config.get('activity_provider_mode') == 'gemini_live':
+            if not self.config.get('google_assistant_api_key') or not self.config.get('activity_allow_remote'):
+                return 'проверь настройки Gemini'
+            status = ((self.backend_status or {}).get('focus') or {}).get('live_engine') or {}
+            if status.get('state') == 'ERROR':
+                return 'ошибка Gemini'
+            return 'готов' if status.get('state') in ('READY', 'ANALYZING', 'SPEAKING') else 'внешний'
+        if live_factory(self.config):
+            return 'готов'
         if self.endpoint is None:
             return await probe_external(self.session, self.config)
         url, wanted, key, bundled = self.endpoint
@@ -432,6 +444,20 @@ class StartupOrchestrator:
         label = {'BREAK': 'перерыв', 'PAUSED': 'возобнови спринт', 'ACTIVE': 'спринт идёт'}.get(sprint, 'начни спринт')
         self.tray.update('limited' if limited else 'ready' if sprint == 'ACTIVE' else 'paused', label, self.llm_health)
 
+    async def reload_model_settings(self):
+        updated = load_config(self.root)
+        endpoint = local_endpoint(updated)
+        changed = (self.endpoint != endpoint or
+                   self.config.get('activity_provider_mode') != updated.get('activity_provider_mode'))
+        self.config = updated
+        if changed:
+            if self.llm:
+                await self.stop_child(self.llm)
+                self.llm = None
+            self.endpoint = endpoint
+            self.llm_attempts = 0
+            await self.ensure_llm()
+
     async def run(self):
         pump = asyncio.create_task(self._pump())
         llm_recovery = None
@@ -445,6 +471,7 @@ class StartupOrchestrator:
             next_probe = 0.0
             next_llm = 0.0
             while not self.exit.is_set():
+                reconfigure = False
                 if self.restart_requested:
                     self.restart_requested = False
                     if self.backend and self.backend.poll() is None:
@@ -452,6 +479,7 @@ class StartupOrchestrator:
                         await self.stop_child(self.backend, 6 if released else 0)
                     self.backend = None
                     failures, exhausted = 0, False
+                    reconfigure = True
                 elif self.backend and self.backend.poll() is not None:
                     code = self.backend.returncode
                     self.backend = None
@@ -460,11 +488,18 @@ class StartupOrchestrator:
                         break  # Explicit Exit from the web panel.
                     if code == RESTART_CODE:
                         failures = 0
+                        reconfigure = True
                     else:
                         failures += 1
                         logging.warning('[Startup] Backend exited with code %d', code)
                         exhausted = failures > (MAX_RETRIES if self.config['startup_recover'] else 0)
 
+                if reconfigure:
+                    if llm_recovery:
+                        llm_recovery.cancel()
+                        await asyncio.gather(llm_recovery, return_exceptions=True)
+                        llm_recovery = None
+                    await self.reload_model_settings()
                 if self.backend is None and not exhausted:
                     self.tray.update('loading', 'запуск backend', self.llm_health)
                     if failures and not await self.wait(min(4, 2 ** (failures - 1))):

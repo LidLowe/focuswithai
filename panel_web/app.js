@@ -286,7 +286,7 @@ function lwAdd(el, value) {
 
 const NAV = [
   ['Работа', [['today', 'Сегодня'], ['sprints', 'Спринты и история'], ['activity', 'Монитор активности'], ['focus', 'HUD и шкала'], ['intervention', 'Вмешательства'], ['schedule', 'Расписание'], ['rules', 'Правила фокуса']]],
-  ['Ассистент', [['assistant', 'Характер и реплики'], ['model', 'AI Provider'], ['voice', 'Эффекты и голос']]],
+  ['Ассистент', [['live', 'Live Engine'], ['assistant', 'Характер и реплики'], ['model', 'AI Provider'], ['voice', 'Эффекты и голос']]],
   ['Система', [['startup', 'Автозапуск'], ['memory', 'Память ассистента'], ['system', 'Система'], ['diagnostics', 'Диагностика AI'], ['files', 'config.json вручную']]],
 ];
 const TITLES = Object.fromEntries(NAV.flatMap(([, items]) => items));
@@ -632,11 +632,11 @@ function activityStatus(st) {
   <div class="inl sprint-actions">
     ${src.armed ? '<button class="btn dark" type="button" data-ctl="focus_capture_stop">Остановить захват</button>'
     : live && src.enabled && src.available ?
-      '<button class="btn" type="button" data-ctl="focus_capture_start">Выбрать рабочее окно</button>' : ''}
+      '<button class="btn" type="button" data-act="capturechoices">Выбрать рабочее окно</button>' : ''}
     ${live ? '<button class="btn" type="button" data-ctl="pause">Пауза мониторинга</button>' : ''}
   </div>
   <p class="note">${src.armed ? src.capturing ? 'Захват рабочего окна включён. Ctrl+Shift+F9 останавливает его.' :
-    'Переключись на разрешённое рабочее окно. Захват привяжется к нему.' :
+    'Захват ожидает выбранное рабочее окно на переднем плане.' :
     'Захват выключен. Кадры остаются в памяти приложения.'}</p>
   ${src.capture_error || src.media_error ? `<p class="note">Источник данных недоступен · ${esc(src.capture_error || src.media_error)}</p>` : ''}`;
 }
@@ -658,6 +658,7 @@ PAGES.activity = {
   render() {
     return `<header class="ph"><h1>Монитор активности</h1>${saveBar()}</header>
       <section class="card pad" data-activity-live>${activityStatus(S.status)}</section>
+      <section class="card pad" data-capture-choices hidden></section>
       <section class="card">
         <div class="card-top"><h2>Источники контекста</h2></div>
         ${contextFlag('Разрешить ручной захват окна', 'capture_enabled')}
@@ -710,10 +711,54 @@ PAGES.diagnostics = {
   },
 };
 
+const inferenceModes = [['request', 'Запрос и ответ'], ['lmstudio_stream', 'LM Studio · поток и сессия'], ['live_mock', 'Live Mock · локальный тест'], ['gemini_live', 'Gemini 3.8 Live']];
+
+function liveStatus(st) {
+  const live = st?.focus?.live_engine;
+  if (!live) return '<p>Live Engine выключен. Выбери режим Live, сохрани настройки и перезапусти трекер.</p>';
+  const fields = [['Сессия', live.state], ['Транспорт', live.backend], ['Подключение', fmtMS(live.connected_seconds)],
+    ['События', live.events], ['Кадры', live.frames], ['Задержка, мс', live.latency_ms ?? '—'],
+    ['Классификация', live.result?.classification || '—'], ['Комментарий', live.comment || '—'],
+    ['Буфер PCM, байт', live.buffer_bytes], ['Прервано при переполнении', live.audio_dropped], ['Переподключения', live.reconnects],
+    ['Токены', live.tokens ?? '—'], ['Ошибка', live.error || live.audio_error || '—']];
+  return `<div class="activity-grid">${fields.map(([label, value]) => `<div><span class="note">${label}</span><b>${esc(value)}</b></div>`).join('')}</div>`;
+}
+
+PAGES.live = {
+  narrow: true,
+  render() {
+    return `<header class="ph"><h1>Live Engine</h1>${saveBar()}</header>
+      <section class="card pad" data-live-session>${liveStatus(S.status)}</section>
+      <section class="card">
+        ${contextField('Режим анализа', 'activity_provider_mode', inferenceModes)}
+        ${eff('activity_provider_mode') === 'gemini_live' ? `
+          ${row('API-ключ Gemini', 'Модель gemini-3.8-live выбрана автоматически.', 'google_assistant_api_key', txt('google_assistant_api_key', {secret: true, label: 'API-ключ Gemini'}))}
+          ${contextFlag('Разрешить отправку цели и текстового контекста активности в Google', 'activity_allow_remote')}
+          ${contextFlag('Разрешить отправку кадров выбранного окна в Google', 'activity_send_remote_images')}
+          <div class="card pad"><button class="btn" data-act="testgeminilive" ${S.busy.gemini ? 'disabled' : ''}>Проверить подключение</button></div>` : ''}
+        ${contextField('Воспроизведение', 'notification_mode', [['', 'Исходный режим'], ...Object.entries(AUDIO_MODES)])}
+        ${contextNumber('Интервал анализа, с', 'live_analysis_seconds', 2, 120)}
+        ${contextNumber('Громкость Live Audio', 'live_volume', 0, 1, .05)}
+        ${eff('activity_provider_mode') === 'gemini_live' ? '' : contextNumber('Частота PCM16, Гц', 'live_sample_rate', 8000, 48000)}
+        ${contextFlag('Инициативные комментарии', 'live_proactive')}
+        ${contextField('Характер комментариев', 'live_style', [['concise', 'Спокойный'], ['direct', 'Бодрый и прямой']])}
+        ${row('Приложения в контексте модели', 'Имена разрешённых EXE, например Code.exe.', 'context_allowed_apps',
+          lw('context_allowed_apps', 'rows', {name:'Имя EXE', add:'Добавить'}))}
+      </section><section class="card pad">
+      <p>${eff('activity_provider_mode') === 'gemini_live' ? 'После сохранения перезапусти трекер и начни спринт. Для голосового комментария нажми «Предложить следующий шаг».' : 'Live Mock озвучивает комментарий тестовым сигналом.'}</p>
+      <div class="inl"><a href="#/activity">Разрешения источников</a>
+      <a href="#/diagnostics">Предпросмотр контекста</a>
+      <button class="btn" data-ctl="focus_commentary" data-value="NEXT_STEP">Предложить следующий шаг</button>
+      <button class="btn" data-ctl="focus_commentary" data-value="SUMMARY">Подвести итоги</button>
+      <button class="btn" data-act="stopaudio">Остановить звук</button></div>
+      </section>`;
+  },
+};
+
 function multimodalSettings() {
   return `<section class="card">
     <div class="card-top"><h2>Анализ активности</h2></div>
-    ${contextField('Режим инференса', 'activity_provider_mode', [['request', 'Запрос и ответ'], ['lmstudio_stream', 'LM Studio · поток и сессия']])}
+    ${contextField('Режим инференса', 'activity_provider_mode', inferenceModes)}
     ${contextFlag('Выбранная модель понимает изображения', 'activity_provider_vision')}
     ${contextFlag('Разрешить внешнему провайдеру текстовый контекст', 'activity_allow_remote')}
     ${contextFlag('Разрешить внешнему провайдеру кадры', 'activity_send_remote_images')}
@@ -1101,7 +1146,7 @@ const PACK_EVENTS = {
   FOCUS_WARNING: 'Предупреждение фокуса', FOCUS_CRITICAL: 'Критический уровень фокуса',
 };
 const AUDIO_MODES = { tts: 'Только TTS', voicepack: 'Только VoicePack', alarm: 'Только эффекты',
-  alarm_voicepack: 'Эффекты + VoicePack', alarm_tts: 'Эффекты + TTS' };
+  alarm_voicepack: 'Эффекты + VoicePack', alarm_tts: 'Эффекты + TTS', live: 'Live Audio', alarm_live: 'Alarm + Live Audio' };
 
 function audioField(label, key, renderControl) {
   const id = nid();
@@ -1467,6 +1512,17 @@ async function busy(key, fn) {
 
 const ACTIONS = {
   save: saveAll,
+  async capturechoices() {
+    try {
+      const { windows } = await api('/api/activity/windows');
+      const list = $('[data-capture-choices]');
+      if (!list) return;
+      list.hidden = false;
+      list.innerHTML = windows.length ? windows.map(w =>
+        `<button class="btn" type="button" data-ctl="focus_capture_start" data-value="${esc(w.id)}">${esc(w.title)}</button>`).join(' ')
+        : 'Нет открытых окон из списка разрешённых EXE.';
+    } catch (error) { toast(error.message, { bad: true }); }
+  },
   async contextpreview() {
     try {
       const { preview } = await api('/api/activity/preview', { method: 'POST', body: {} });
@@ -1554,6 +1610,12 @@ const ACTIONS = {
     if (!S.reply || !S.reply.text) return;
     try { await api('/api/test/tts', { method: 'POST', body: { draft: draftConfig(), text: S.reply.text } }); } catch (e) { toast(e.message, { bad: true }); }
   },
+  testgeminilive: () => busy('gemini', async () => {
+    const r = await api('/api/test/gemini-live', {method: 'POST', body: {draft: {
+      google_assistant_api_key: eff('google_assistant_api_key'), activity_allow_remote: eff('activity_allow_remote')
+    }}});
+    toast(`Подключение к ${r.model} подтверждено.`);
+  }),
   testai: (el) => busy('ai', async () => {
     const r = await api('/api/test/ai', { method: 'POST', body: { draft: draftConfig(), provider: el.dataset.p } });
     S.aiTest = { ...r, provider: el.dataset.p };
@@ -1648,7 +1710,11 @@ document.addEventListener('click', async (e) => {
   if (!t) return;
   const d = t.dataset;
   if (d.act && ACTIONS[d.act]) { e.preventDefault(); ACTIONS[d.act](t); return; }
-  if (d.ctl) { control(d.ctl, d.ctl === 'extend' ? 5 : undefined); return; }
+  if (d.ctl) {
+    if (d.ctl === 'focus_capture_start') t.closest('[data-capture-choices]')?.setAttribute('hidden', '');
+    control(d.ctl, d.ctl === 'extend' ? 5 : d.value);
+    return;
+  }
 
   // списки
   const lwEl = t.closest('.lw');
@@ -1793,7 +1859,13 @@ document.addEventListener('change', async (e) => {
     setv('notification_disabled_events', [...disabled]); return;
   }
   if (el.dataset.k && (el.type === 'radio' || el.type === 'checkbox' || el.tagName === 'SELECT')) {
-    onField(el); if (['tts_engines', 'voicepack_id', 'alarm_pack_id'].includes(el.dataset.k)) render(); return;
+    onField(el);
+    if (el.dataset.k === 'activity_provider_mode' && el.value === 'gemini_live') {
+      const mode = eff('notification_mode') || '';
+      if (!['alarm_live', 'live'].includes(mode)) setv('notification_mode', mode.startsWith('alarm') ? 'alarm_live' : 'live');
+    }
+    if (['activity_provider_mode', 'tts_engines', 'voicepack_id', 'alarm_pack_id'].includes(el.dataset.k)) render();
+    return;
   }
   if (el.dataset.importAudio && el.files.length) {
     const { importAudio: kind, pack, event } = el.dataset;
@@ -1934,6 +2006,9 @@ async function poll() {
       const current = document.activeElement?.dataset.ctl;
       if (setHtml(section, focusStatus(S.status)) && current) $(`[data-ctl="${current}"]`, section)?.focus();
     }
+  } else if (S.route === 'live' && S.cfg) {
+    const section = $('[data-live-session]');
+    if (section) setHtml(section, liveStatus(S.status));
   } else if (S.route === 'activity' && S.cfg) {
     const section = $('[data-activity-live]');
     if (section) setHtml(section, activityStatus(S.status));

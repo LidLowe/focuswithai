@@ -73,6 +73,27 @@ def capture_window(window, dimensions, quality):
     return Frame(output.getvalue(), gray.tobytes(), image.width, image.height, time.monotonic())
 
 
+def capture_choices(privacy):
+    from focus_meter import Foreground
+    from focus_windows import executable_for_pid
+    choices = []
+
+    def visit(hwnd, unused):
+        try:
+            if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd) or len(choices) >= 64:
+                return True
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            window = Foreground(hwnd, pid, win32gui.GetWindowText(hwnd), executable_for_pid(pid))
+            if pid != os.getpid() and window.title and privacy.capture_allowed(window):
+                choices.append(dict(id=f'{hwnd}-{pid}', handle=hwnd, pid=pid, title=clean(window.title)))
+        except (OSError, WinError):
+            pass
+        return True
+
+    win32gui.EnumWindows(visit, None)
+    return choices
+
+
 def user_apps():
     """Return visible taskbar-style window PIDs and names, with no window text."""
     found = {}

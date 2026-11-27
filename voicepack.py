@@ -88,7 +88,7 @@ PACK_ID = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}\Z')
 FORMATS = {'.wav', '.mp3', '.ogg'}
 MAX_CLIP_BYTES = 16 * 1024 * 1024
 MAX_CLIP_SECONDS = 30
-MODES = ('tts', 'voicepack', 'alarm', 'alarm_voicepack', 'alarm_tts')
+MODES = ('tts', 'voicepack', 'alarm', 'alarm_voicepack', 'alarm_tts', 'live', 'alarm_live')
 
 
 def notification_mode(config):
@@ -212,6 +212,10 @@ class ClipPlayer:
         self._owner_generation = 0
         self._channel = None
         self._generation = 0
+
+    @property
+    def busy(self):
+        return self._lock.locked()
 
     @asynccontextmanager
     async def sequence(self):
@@ -432,12 +436,12 @@ def parse_decision(text, allowed):
 class VoicePackNotifier:
     """Runs one classification/playback job, with no backlog of stale alerts."""
 
-    def __init__(self, config, client, speaker):
+    def __init__(self, config, client, speaker, *, player=None):
         self.config = {**DEFAULTS, **config}
         self.mode = notification_mode(config) or 'voicepack'
         self.client = client
         self.speaker = speaker
-        self.player = ClipPlayer()
+        self.player = player or ClipPlayer()
         self.engine = VoicePackEngine(VoicePackCatalog(), self.player)
         self.alarms = AlarmEngine(self.player)
         self.interval = _seconds(config, 'voicepack_min_interval', DEFAULTS['voicepack_min_interval'], 5)
@@ -482,6 +486,8 @@ class VoicePackNotifier:
         return {'event': event.value, 'reason': reason, 'source': 'tracker'}
 
     def notify(self, event, evidence, use_ai=True, play_sound=True, mode_override=None, on_play=None):
+        if self.mode in ('live', 'alarm_live'):
+            return False  # The live coordinator admits both parts of a notification together.
         if event in self.disabled or (self._task is not None and not self._task.done()):
             return False
         if time.monotonic() - self.last_notice < self.interval:
@@ -534,6 +540,12 @@ class VoicePackNotifier:
             pass
         except Exception as error:
             logging.warning('[VoicePack] Ошибка уведомления: %s', error)
+
+    async def live_alarm(self, event):
+        if self.mode in ('alarm_live', 'alarm_tts') and self.alarm_level and event not in self.disabled:
+            pack = self.config['alarm_pack_id']
+            if await self.alarms.play_event(pack, event, self.alarm_level, override=self._mapping('alarm', pack, event)):
+                await asyncio.sleep(self.delay)
 
     def _mapping(self, kind, pack_id, event):
         value = self.config['audio_event_mappings']
