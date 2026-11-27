@@ -106,10 +106,8 @@ class FocusController:
             'warning': bool(engine and engine.current_warning(now)),
         }
 
-    def suspend(self, terminal=None, paused=None):
-        phase = self.phase()
-        resting = phase.paused or bool(phase.sprint and phase.sprint['state'] == 'BREAK')
-        self.live.stop(terminal, resting if paused is None else paused)
+    def suspend(self, reason='observation_reset'):
+        self.live.session.hold(reason)
         if self.confirmed:
             self.stop_audio()
         self.confirmed = False
@@ -149,7 +147,7 @@ class FocusController:
             return
         if action == 'capture_stop':
             self.acquisition.stop_capture()
-            self.live.stop()
+            self.live.session.hold('capture_stopped')
             return
         if action == 'correct':
             result = self.live.session.result
@@ -168,7 +166,7 @@ class FocusController:
         if action == 'disable':
             self.intervention.disable()
             self.acquisition.stop_capture()
-            self.live.stop()
+            self.live.session.hold('capture_stopped')
             self.stop_audio()
         elif action == 'enable':
             self.intervention.silenced = False
@@ -204,11 +202,13 @@ class FocusController:
         if phase.key != self.phase_key:
             self.phase_key = phase.key
             self.meter.reset(now)
-            self.suspend()
+            self.suspend('sprint_phase_changed')
+        self.live.sync_phase(phase)
         weight, confirmed = 0, False
         if not phase.active:
             if self.acquisition.active:
-                self.suspend()
+                self.suspend('sprint_inactive')
+                self.live.sync_phase(phase)
             self.state = ActivityState.BREAK
             self.reason = ('Возобнови спринт в панели.' if phase.paused else
                            'Идёт перерыв.' if phase.sprint else 'Начни спринт в панели.')
@@ -219,7 +219,7 @@ class FocusController:
             window, idle = self.sample
             private = self.acquisition.privacy.excluded(window)
             if private and not self.was_private:
-                self.suspend()
+                self.suspend('excluded_window')
                 self.sample = window, idle
                 self.next_sample = now + 1
             self.was_private = private
@@ -228,24 +228,29 @@ class FocusController:
             signature = (phase.context, window, (context.browser['domain'], context.browser['title']) if context.browser else None)
             if signature != self.signature:
                 new_context = self.signature is None or self.signature[0] != phase.context
-                if self.live.session.task:
-                    self.live.session.invalidate()
                 self.decision.reset(keep_correction=not new_context)
                 self.signature = signature
             self.next_action = None
             browser = ntpath.basename(window.executable).casefold() in BROWSERS
-            if self.live.session.task and (private or idle or (browser and not context.browser)
-                                                          or not window.title or not self.use_ai()):
-                self.live.stop(keep_request=browser and not private and self.use_ai())
-            if private or (browser and not context.browser):
-                self.state, self.reason = ActivityState.UNCERTAIN, 'Для окна нет разрешённого контекста.'
+            blocked = None
+            if not self.use_ai():
+                blocked = ('analysis_disabled', 'Анализ приостановлен.')
+            elif private:
+                blocked = ('excluded_window', 'Окно исключено из анализа.')
+            elif browser and not context.browser:
+                blocked = ('browser_tab_not_allowed', 'Вкладка браузера не разрешена.')
             elif idle:
-                self.state, self.reason = ActivityState.IDLE, 'Давно не было мыши или клавиатуры.'
-            elif phase.context and self.use_ai() and window.title and now - context.entered >= 2:
-                result = None
-                if self.acquisition.foreground_is_current():
-                    facts, frame = context.snapshot(now, phase.context, self.meter.score)
-                    result = self.live.sample(now, phase, signature, facts, frame)
+                blocked = ('idle', 'Давно не было мыши или клавиатуры.')
+            elif not window.title:
+                blocked = ('missing_window_title', 'У активного окна нет заголовка.')
+            elif now - context.entered < 2 or not self.acquisition.foreground_is_current():
+                blocked = ('window_settling', 'Ожидаю актуальный контекст окна.')
+            if blocked:
+                self.live.session.hold(blocked[0], paused=not self.use_ai())
+                self.state, self.reason = ActivityState.UNCERTAIN, blocked[1]
+            else:
+                facts, frame = context.snapshot(now, phase.context, self.meter.score)
+                result = self.live.sample(now, phase, signature, facts, frame)
                 finished = self.live.session.finished_at
                 if result and self.consumed != finished:
                     self.consumed = finished
@@ -255,10 +260,9 @@ class FocusController:
                 )
                 self.reason = result.reason if result else self.live.session.error or 'Ожидаю подтверждения от Gemini Live.'
                 self.next_action = result.suggested_next_step if confirmed else None
-            else:
-                self.state, self.reason = ActivityState.UNCERTAIN, 'Ожидаю достаточно контекста для анализа.'
             if self.observe:
-                self.observe(now, self.state.value, '' if private else window.executable)
+                self.observe(now, ActivityState.IDLE.value if idle and not private else self.state.value,
+                             '' if private else window.executable)
             if self.intervention:
                 if confirmed:
                     self.intervention.guard.tick(now, window)

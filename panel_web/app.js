@@ -668,16 +668,31 @@ PAGES.diagnostics = {
 function liveStatus(st) {
   const live = st?.focus?.live_engine;
   if (!live) return '<p>Статус появится после запуска трекера.</p>';
-  const fields = [['Сессия', live.state], ['Модель', live.model], ['Подключение', fmtMS(live.connected_seconds)],
+  if (!live.connection_state) return '<p>Перезапусти FocusWithAI после спринта, чтобы применить обновление.</p>';
+  const fields = [['Соединение', live.connection_state], ['Анализ', live.analysis_state], ['Аудио', live.audio_state],
+    ['Модель', live.model], ['Время соединения', fmtMS(live.connected_seconds)],
     ['События', live.events], ['Кадры', live.frames], ['Задержка, мс', live.latency_ms ?? '—'],
-    ['Классификация', live.result?.classification || '—'], ['Комментарий', live.comment || '—'],
+    ['Классификация', live.result?.classification || (live.block_reason && st.sprint?.state === 'ACTIVE' ? 'UNCERTAIN' : '—')], ['Комментарий', live.comment || '—'],
     ['Буфер PCM, байт', live.buffer_bytes], ['Прервано при переполнении', live.audio_dropped], ['Переподключения', live.reconnects],
     ['Токены', live.tokens ?? '—'], ['Ошибка', live.error || live.audio_error || '—']];
   const result = live.result;
   return `<div class="activity-grid">${fields.map(([label, value]) => `<div><span class="note">${label}</span><b>${esc(value)}</b></div>`).join('')}</div>
+    ${live.block_reason && st.focus.reason ? `<p class="note">${esc(st.focus.reason)}</p>` : ''}
     ${result ? `<p>${esc(result.observed_activity)} · ${Math.round(result.confidence * 100)}%</p><p>${esc(result.reason)}</p>
     ${st.focus.suggested_next_step ? `<p>Следующий шаг · ${esc(st.focus.suggested_next_step)}</p>` : ''}
     <button class="btn" data-ctl="focus_correct">Отметить ошибку классификации</button>` : ''}`;
+}
+
+const LIVE_CHECKS = {connection: 'Подключение', classification: 'Классификация', audio: 'Нативное аудио'};
+
+function liveProbeStatus(probe) {
+  if (!probe?.stages) return '';
+  const statuses = {ok: 'Успешно', error: 'Ошибка', skipped: 'Пропущено'};
+  return `<div class="activity-grid">${Object.entries(LIVE_CHECKS).map(([stage, label]) => {
+    const result = probe.stages[stage];
+    return `<div><span class="note">${label}</span><b>${statuses[result.status]}</b>
+      ${result.detail ? `<span>${esc(result.detail)}</span>` : ''}</div>`;
+  }).join('')}</div>`;
 }
 
 PAGES.live = {
@@ -698,8 +713,14 @@ PAGES.live = {
         ${row('Приложения в контексте модели', 'Имена разрешённых EXE, например Code.exe.', 'context_allowed_apps',
           lw('context_allowed_apps', 'rows', {name:'Имя EXE', add:'Добавить'}))}
       </section>
+      <section class="card pad">
+        <h2>Проверка Gemini Live</h2>
+        <div class="inl">${Object.entries(LIVE_CHECKS).map(([stage, label]) =>
+          `<button class="btn" data-act="testgeminilive" data-through="${stage}" ${S.busy.gemini || !S.status?.focus?.live_engine?.connection_state ? 'disabled' : ''}>${label}</button>`).join('')}</div>
+        ${S.busy.gemini ? '<p role="status">Проверяю…</p>' : liveProbeStatus(S.geminiProbe)}
+        <p class="note">Классификация и аудио проверяются на синтетическом примере. Аудио проверяется без воспроизведения.</p>
+      </section>
       <section class="card pad inl">
-        <button class="btn" data-act="testgeminilive" ${S.busy.gemini ? 'disabled' : ''}>Проверить подключение</button>
         <button class="btn" data-ctl="focus_commentary" data-value="NEXT_STEP">Предложить следующий шаг</button>
         <button class="btn" data-ctl="focus_commentary" data-value="SUMMARY">Подвести итоги</button>
         <button class="btn" data-act="stopaudio">Остановить звук</button>
@@ -999,12 +1020,13 @@ const ACTIONS = {
     if (!confirm('Остановить трекер? Панель закроется вместе с ним.')) return;
     try { await api('/api/process', { method: 'POST', body: { action: 'stop' } }); toast('Трекер останавливается'); } catch (e) { toast(e.message, { bad: true }); }
   },
-  testgeminilive: () => busy('gemini', async () => {
-    const r = await api('/api/test/gemini-live', {method: 'POST', body: {draft: {
+  testgeminilive: (el) => busy('gemini', async () => {
+    S.geminiProbe = null;
+    const r = await api('/api/test/gemini-live', {method: 'POST', body: {through: el.dataset.through, draft: {
       google_assistant_api_key: eff('google_assistant_api_key'), activity_allow_remote: eff('activity_allow_remote'),
       gemini_live_model: eff('gemini_live_model'), gemini_live_voice: eff('gemini_live_voice')
     }}});
-    toast(`Подключение к ${r.model} подтверждено.`);
+    S.geminiProbe = r;
   }),
   reloadpacks: () => busy('packList', async () => { S.audioPacks = await api('/api/audio/packs'); }),
   chooseaudio: (el) => $(`[data-import-audio="${el.dataset.kind}"]`)?.click(),

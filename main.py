@@ -186,16 +186,8 @@ class Runtime:
                 or (before.sprint and before.sprint['state'] == 'ACTIVE' and not after.active)):
             self.stop_audio()
             if self.focus:
-                terminal = {'break': 'BREAK_STARTED', 'pause': 'SPRINT_PAUSED', 'complete': 'SPRINT_COMPLETED',
-                            'cancel': 'SPRINT_COMPLETED'}.get(action)
-                self.focus.suspend(terminal, paused=bool(after.sprint and after.sprint['state'] in ('PAUSED', 'BREAK')))
-                if after.active:
-                    if not before.sprint or before.sprint['id'] != after.sprint['id']:
-                        self.focus.live.next_start = 'SPRINT_STARTED'
-                    elif before.sprint['state'] == 'BREAK':
-                        self.focus.live.next_start = 'BREAK_ENDED'
-                    elif before.sprint and before.sprint['id'] == after.sprint['id']:
-                        self.focus.live.next_start = 'SPRINT_UPDATED'
+                self.focus.suspend('sprint_phase_changed')
+                self.focus.live.sync_phase(after, reason=action)
                 if before.key != after.key:
                     self.focus.meter.reset(time.monotonic())
         if before.active != after.active or (before.sprint and not after.sprint):
@@ -266,7 +258,7 @@ class Runtime:
         shutdown_flag = True
         self.stop_audio()
         if self.focus:
-            self.focus.suspend()
+            self.focus.suspend('shutdown')
         wake_event.set()
 
 

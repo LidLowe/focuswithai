@@ -46,7 +46,7 @@ class StreamTests(unittest.TestCase):
         for i in range(100):
             frame = Frame(bytes([i]), bytes([i]), 2, 2, i)
             stream.observe(facts(), frame, 'window', 20, 10)
-        self.assertLessEqual(len(stream.pending), 7)
+        self.assertLessEqual(len(stream.pending), 8)
         self.assertIs(stream.pending['SCREEN_FRAME'].data, frame)
         self.assertEqual(stream.pending['ACTIVITY_DURATION'].stamp, stream.stamp)
         stream.pending.clear()
@@ -58,6 +58,20 @@ class StreamTests(unittest.TestCase):
         self.assertIn('SPRINT_STARTED', stream.pending)
         self.assertEqual(stream.preview()['SCREEN_FRAME']['bytes'], 1)
         self.assertNotIn(frame.data, stream.preview().values())
+
+    def test_new_frame_coalesces_without_invalidating_an_in_flight_assessment(self):
+        stream = ContextStream()
+        stream.start('sprint', {})
+        stream.observe(facts(), Frame(b'a', b'a', 1, 1, 20), 'same window', 20, 8)
+        stamp = stream.stamp
+        stream.observe(facts(), Frame(b'b', b'b', 1, 1, 21), 'same window', 21, 8)
+        self.assertEqual(stream.stamp, stamp)
+        self.assertEqual(stream.pending['SCREEN_FRAME'].data.data, b'b')
+        self.assertEqual(next(reversed(stream.pending)), 'ACTIVITY_DURATION')
+        stream.block()
+        self.assertFalse(stream.pending)
+        self.assertNotIn('SCREEN_FRAME', stream.latest)
+        self.assertNotEqual(stream.stamp, stamp)
 
     def test_recent_switches_and_warnings_travel_before_the_analysis(self):
         stream = ContextStream()

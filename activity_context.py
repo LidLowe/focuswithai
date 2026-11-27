@@ -113,6 +113,12 @@ class Privacy:
         return {'domain': domain, 'title': clean(title)}
 
 
+def sprint_context(sprint):
+    return {key: ([{'text': clean(task['text'], 120), 'done': task['done']} for task in value[:15]]
+                  if key == 'subtasks' else clean(value, 650) if isinstance(value, str) else value)
+            for key, value in json.loads(sprint).items()}
+
+
 class ContextAggregator:
     def __init__(self, privacy):
         self.privacy = privacy
@@ -132,7 +138,8 @@ class ContextAggregator:
     def sample(self, now, window):
         if window != self.window:
             old_app = ntpath.basename(self.window.executable)
-            if old_app and not self.privacy.excluded(self.window):
+            if (old_app and not self.privacy.excluded(self.window)
+                    and (old_app.casefold() not in BROWSERS or self.browser)):
                 self.switches.append((now, clean(old_app, 70), round(now - self.entered)))
             self.entered, self.window = now, window
             self.frame = self.sent_frame = None
@@ -151,11 +158,8 @@ class ContextAggregator:
         media = None
         if self.media and now - self.media[0] < 35:
             media = self.media[1]
-        sprint_data = json.loads(sprint)
         facts = {
-            'sprint': {key: ([{'text': clean(t['text'], 120), 'done': t['done']} for t in value[:15]]
-                             if key == 'subtasks' else clean(value, 650) if isinstance(value, str) else value)
-                       for key, value in sprint_data.items()},
+            'sprint': sprint_context(sprint),
             'application': clean(app), 'window_title': clean(window.title) if app.casefold() not in BROWSERS else '',
             'activity_seconds': round(now - self.entered),
             'browser': browser, 'media': media, 'user_apps': self.user_apps,

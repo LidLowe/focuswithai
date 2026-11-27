@@ -1,3 +1,4 @@
+import json
 import time
 import unittest
 from types import SimpleNamespace
@@ -53,7 +54,7 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
             calls.append(('alarm', time.monotonic(), args[1]))
             return True
         notifier.alarms.play_event = alarm
-        phase = SimpleNamespace(key=('abc', 0), active=True, sprint={'id': 'abc'}, context='demo')
+        phase = SimpleNamespace(key=('abc', 0), active=True, sprint={'id': 'abc', 'state': 'ACTIVE'}, context=json.dumps({'goal': 'Synthetic exercise'}))
         win = Foreground(1, 2, '[demo] unrelated game', 'demo.exe')
         signature = (phase.context, win, None)
         owner = SimpleNamespace(phase=lambda: phase, phase_key=phase.key, signature=signature,
@@ -65,6 +66,7 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
         sink = Mock(write=AsyncMock(side_effect=lambda _: calls.append(('pcm', time.monotonic(), None))),
                     drain=AsyncMock())
         live.audio.sink_factory = lambda rate, level: sink
+        live.sync_phase(phase)
         data = facts(win.title)
         now = time.monotonic()
         live.sample(now, phase, signature, data, None)
@@ -82,5 +84,7 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(data['sprint']['goal'], live.session.last_comment)
         owner.on_intervention.assert_called_once()
         phase.active = False
-        live.stop('SPRINT_PAUSED', True)
-        self.assertEqual(live.session.state, 'PAUSED')
+        phase.sprint['state'] = 'PAUSED'
+        live.sync_phase(phase)
+        self.assertEqual(live.session.connection_state, 'CONNECTED')
+        self.assertEqual(live.session.analysis_state, 'PAUSED')

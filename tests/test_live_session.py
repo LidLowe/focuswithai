@@ -45,21 +45,26 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         session.observe(facts('other'), None, 2, 12)
         await transports[0].output.put(Output('ASSESSMENT', old, old_turn, 'invalid'))
         await asyncio.sleep(.02)
-        self.assertIsNone(session.result)
-        self.assertNotEqual(session.state, 'ERROR')
-        session.stop('BREAK_STARTED', True)
-        self.assertEqual(session.state, 'PAUSED')
+        self.assertEqual(session.result.observed_activity, 'other')
+        self.assertNotEqual(session.connection_state, 'ERROR')
+        session.hold('break', paused=True)
+        self.assertEqual(session.connection_state, 'CONNECTED')
+        self.assertEqual(session.analysis_state, 'PAUSED')
         session.start('two', {'goal': 'different'}, 'BREAK_ENDED')
         session.observe(facts(), None, 1, 20)
-        await until(lambda: session.result)
-        self.assertIn('BREAK_STARTED', transports[0].kinds)
+        try:
+            await until(lambda: session.result)
+        except TimeoutError:
+            self.fail(f'{session.diagnostics()}, pending={list(session.stream.pending)}, '
+                      f'transports={[(t.closed, t.kinds) for t in transports]}')
         self.assertTrue(transports[0].closed)
+        self.assertNotIn('BREAK_ENDED', transports[0].kinds)
+        self.assertIn('BREAK_ENDED', transports[1].kinds)
         self.assertNotEqual(session.stream.stamp.generation, old.generation)
         self.assertEqual(session.result.classification, 'UNCERTAIN')
         session.stop('SPRINT_COMPLETED')
         await session.close()
         self.assertTrue(transports[-1].closed)
-        self.assertIn('SPRINT_COMPLETED', transports[-1].kinds)
         self.assertFalse(session.stream.latest)
         self.assertIsNone(session.result)
 
@@ -74,13 +79,46 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         session.start('test', facts()['sprint'])
         session.observe(facts(), None, 5, 10)
         await until(lambda: session.reconnects == 1)
-        self.assertEqual(session.state, 'ERROR')
+        self.assertEqual(session.connection_state, 'RECONNECTING')
         self.assertIsNone(session.result)
         session.observe(facts(), None, 5, 30)
         await until(lambda: session.result)
         self.assertEqual(session.result.classification, 'ON_TASK')
         self.assertIn('SPRINT_STARTED', choices[1].kinds)
         self.assertTrue(choices[0].closed)
+
+    async def test_pending_observations_coalesce_while_previous_turn_is_busy(self):
+        class SlowTurn(Trace):
+            def __init__(self):
+                super().__init__()
+                self.ready = asyncio.Event()
+                self.ready.set()
+                self.windows = []
+
+            async def wait_ready(self):
+                await self.ready.wait()
+
+            async def send(self, event):
+                if event.kind == 'FOREGROUND_CHANGED':
+                    self.windows.append(event.data[1])
+                if event.kind == 'ACTIVITY_DURATION':
+                    self.ready.clear()
+                await super().send(event)
+
+        transport = SlowTurn()
+        session = LiveSession({}, Mock(), Mock(), lambda: transport)
+        self.addAsyncCleanup(session.close)
+        session.start('one', facts()['sprint'])
+        session.observe(facts('Synthetic editor'), None, 1, 10)
+        await until(lambda: session.result)
+        session.observe(facts('intermediate'), None, 2, 11)
+        await asyncio.sleep(.02)
+        self.assertEqual(transport.windows, ['Synthetic editor'])
+        session.observe(facts('latest'), None, 3, 12)
+        transport.ready.set()
+        await until(lambda: session.result and session.result.observed_activity == 'latest')
+        self.assertEqual(transport.windows, ['Synthetic editor', 'latest'])
+        self.assertEqual(session.reconnects, 0)
 
     async def test_correction_interrupts_and_clears_accepted_response(self):
         session = LiveSession({}, Mock(), Mock(), MockLiveTransport)

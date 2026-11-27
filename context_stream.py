@@ -38,7 +38,20 @@ class ContextStream:
     def start(self, sprint_id, sprint, kind='SPRINT_STARTED'):
         self.clear()
         self.stamp = Stamp(sprint_id, self.generation, 0)
+        self.sprint_kind = kind
         self.put(kind, sprint)
+
+    def advance(self):
+        stamp = self.stamp
+        self.stamp = Stamp(stamp.sprint_id, stamp.generation, stamp.observation + 1)
+
+    def block(self):
+        if self.stamp is None:
+            return
+        self.advance()
+        self.window_key = self.last_duration = None
+        self.latest = {self.sprint_kind: self.latest[self.sprint_kind]}
+        self.pending.clear()
 
     def event(self, kind, data=None):
         self.sequence += 1
@@ -59,15 +72,20 @@ class ContextStream:
             'USER_APPS_CHANGED': facts['user_apps'],
             'SCREEN_FRAME': frame,
         }
-        changed = {k: v for k, v in values.items() if self.latest.get(k) != v}
-        if changed or self.window_key != window_key:
+        if self.window_key != window_key or self.latest.get('BROWSER_CONTEXT_CHANGED') != values['BROWSER_CONTEXT_CHANGED']:
             self.window_key = window_key
-            self.stamp = Stamp(self.stamp.sprint_id, self.generation, self.stamp.observation + 1)
-            self.pending.pop('RECENT_ACTIVITY', None)
-            if self.pending.pop('ACTIVITY_DURATION', None):
-                self.last_duration = None
-            for kind, data in changed.items():
-                self.put(kind, data)
+            self.advance()
+            self.pending.clear()
+            self.last_duration = None
+            self.put(self.sprint_kind, self.latest[self.sprint_kind])
+            # Explicitly clear old optional sources in the server's conversational context.
+            changed = values
+        else:
+            changed = {k: v for k, v in values.items() if self.latest.get(k) != v}
+        for kind, data in changed.items():
+            self.put(kind, data)
+        if 'ACTIVITY_DURATION' in self.pending:
+            self.pending.move_to_end('ACTIVITY_DURATION')
         if self.last_duration is None or now - self.last_duration >= interval:
             self.last_duration = now
             self.put('ACTIVITY_DURATION', facts['activity_seconds'])

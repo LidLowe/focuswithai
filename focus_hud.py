@@ -238,7 +238,7 @@ class FocusHUD:
             result = live['result']
             if result and result['classification'] == 'INDIRECTLY_RELATED' and state['activity'] == 'ON_TASK':
                 activity = 'Связано с целью'
-            health = 'Gemini · ' + live['state']
+            health = 'Gemini · ' + live['connection_state']
             last_success = live['last_success']
             stamp = time.strftime('%H:%M:%S', time.localtime(last_success)) if last_success else ''
             footer = 'Захват окна · Ctrl+Shift+F9' if recording else ' '.join(filter(None, (health, stamp)))

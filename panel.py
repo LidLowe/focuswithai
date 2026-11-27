@@ -16,7 +16,7 @@ from aiohttp import web
 from audio_import import save_clip
 from config_store import DEFAULT_PORT, SECRET_KEYS, VERSION, defaults, load_config, public_config, save_config
 from gemini_live import MODELS, VOICES, GeminiLiveTransport, validate_preferences
-from live_session import LiveSetupError
+from live_session import LiveSession
 from startup_manager import StartupTask
 from voicepack import (AlarmEngine, ClipPlayer, DEFAULTS as VOICEPACK_DEFAULTS, Event, MAX_CLIP_BYTES,
                        PlaybackStopped, VoicePackCatalog, VoicePackEngine)
@@ -463,16 +463,63 @@ class Panel:
 
     @_handler
     async def test_gemini_live(self, request):
-        transport = GeminiLiveTransport(self._draft(await self._body(request)))
-        try:
-            await asyncio.wait_for(transport.connect('Connection check.'), 12)
-            return _json({'model': transport.model, 'ok': True})
-        except LiveSetupError:
-            raise
-        except Exception as error:
-            return _json({'error': f'Нет соединения с Gemini ({type(error).__name__}).'}, 502)
-        finally:
-            await transport.close()
+        body = await self._body(request)
+        through = body.get('through', 'connection')
+        if through not in ('connection', 'classification', 'audio'):
+            raise ValueError('Неизвестный этап диагностики Gemini Live.')
+        return _json(await probe_gemini_live(self._draft(body), through))
+
+
+async def probe_gemini_live(config, through):
+    """Exercise the production send/receive loop with a disposable synthetic sprint."""
+    config = {**config, 'gemini_live_prompt': '', 'activity_send_remote_images': False, 'live_proactive': False}
+    transport = None
+    stages = {name: {'status': 'skipped'} for name in ('connection', 'classification', 'audio')}
+    def factory():
+        nonlocal transport
+        transport = GeminiLiveTransport(config)
+        return transport
+
+    session = LiveSession(config, lambda message: None, lambda: None, factory)
+
+    async def wait_for(check, seconds, *, connected=False):
+        deadline = time.monotonic() + seconds
+        while not check():
+            if session.connection_state == 'ERROR' or (
+                connected and session.connection_state != 'CONNECTED'
+            ) or time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(.05)
+        return True
+
+    def fail(stage, message):
+        stages[stage] = {'status': 'error', 'detail': session.error or message}
+        return {'model': session.model, 'ok': False, 'stages': stages}
+
+    goal = {'goal': 'Edit the example function in the synthetic programming exercise.'}
+    facts = {'sprint': goal, 'application': 'example-editor', 'window_title': 'Synthetic programming exercise',
+             'activity_seconds': 4, 'browser': None, 'media': None, 'user_apps': []}
+    session.start('diagnostic', goal, 'SPRINT_STARTED')
+    try:
+        if not await wait_for(lambda: session.connection_state == 'CONNECTED', 13):
+            return fail('connection', 'Истёк тайм-аут подключения.')
+        stages['connection'] = {'status': 'ok', 'detail': 'WebSocket и setupComplete подтверждены.'}
+        if through != 'connection':
+            session.observe(facts, None, 'synthetic', time.monotonic())
+            if through == 'audio':
+                session.command('COMMENTARY_REQUEST', 'NEXT_STEP')
+                session.observe(facts, None, 'synthetic', time.monotonic())
+            if not await wait_for(lambda: session.result is not None, session.response_timeout, connected=True):
+                return fail('classification', 'Gemini не вернул структурированную оценку.')
+            stages['classification'] = {'status': 'ok', 'detail': session.result.classification.value}
+        if through == 'audio':
+            if not await wait_for(lambda: transport.native_audio_bytes > 0, 20, connected=True):
+                return fail('audio', 'Gemini не прислал нативный PCM16 для тестовой реплики.')
+            stages['audio'] = {'status': 'ok', 'detail': f'Получен PCM16 24 кГц ({transport.native_audio_bytes} байт).'}
+        return {'model': session.model, 'ok': True, 'stages': stages}
+    finally:
+        await session.close()
+
 
 async def start_panel(runtime, config: Dict[str, Any]) -> Optional[web.AppRunner]:
     """Запускает панель на 127.0.0.1. Возвращает runner для остановки или None"""

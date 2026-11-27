@@ -51,12 +51,12 @@ class HudTests(unittest.TestCase):
                 hud.update({
                     'sources': {'armed': False}, 'sprint': None, 'meter_enabled': False,
                     'activity': 'ON_TASK', 'score': 0, 'level': 'NORMAL', 'task': '',
-                    'live_engine': {'state': 'READY', 'last_success': None,
+                    'live_engine': {'connection_state': 'CONNECTED', 'last_success': None,
                                     'result': {'classification': 'INDIRECTLY_RELATED'}},
                 }, None)
                 content = factory.return_value.show.call_args.args[1]
                 self.assertEqual(content[3], 'Связано с целью')
-                self.assertEqual(content[-2], 'Gemini · READY')
+                self.assertEqual(content[-2], 'Gemini · CONNECTED')
             finally:
                 hud.close()
 

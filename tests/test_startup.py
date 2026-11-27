@@ -26,7 +26,7 @@ class StartupSupervisorTests(unittest.IsolatedAsyncioTestCase):
 
     def test_tray_uses_backend_reported_gemini_state(self):
         manager = self.new()
-        manager.backend_status = {'sprint': {'state': 'ACTIVE'}, 'focus': {'live_engine': {'state': 'ERROR'}}}
+        manager.backend_status = {'sprint': {'state': 'ACTIVE'}, 'focus': {'live_engine': {'connection_state': 'ERROR'}}}
         manager._update_tray()
         manager.tray.update.assert_called_once_with('limited', 'спринт идёт', 'ERROR')
 

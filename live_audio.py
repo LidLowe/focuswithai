@@ -53,10 +53,17 @@ class LiveAudio:
         self.task = self.queue = self.response = None
         self.buffered = self.dropped = 0
         self.error = None
+        self.playing = False
 
     @property
     def busy(self):
         return bool(self.task and not self.task.done())
+
+    @property
+    def state(self):
+        if not self.response or not self.busy:
+            return 'SILENT'
+        return 'SPEAKING' if self.playing else 'BUFFERING'
 
     def start(self, response, rate, current, prelude, on_play=None):
         if self.busy or self.player.busy or type(rate) is not int or not 8000 <= rate <= 48000:
@@ -104,6 +111,7 @@ class LiveAudio:
             self.task.cancel()
         self.queue = self.response = None
         self.buffered = 0
+        self.playing = False
 
     async def _play(self, queue, rate, current, prelude, on_play):
         sink = None
@@ -119,6 +127,7 @@ class LiveAudio:
                 if not current():
                     return
                 sink = self.sink_factory(rate, self.volume)
+                self.playing = True
                 if on_play:
                     on_play()
                 while chunk is not None and current():
@@ -136,6 +145,7 @@ class LiveAudio:
                 sink.stop()
             self.response = self.queue = None
             self.buffered = 0
+            self.playing = False
 
     async def close(self):
         self.cancel()

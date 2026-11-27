@@ -2,6 +2,7 @@
 import asyncio
 import inspect
 import math
+import logging
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -9,6 +10,23 @@ from dataclasses import dataclass
 from activity_protocol import PROTOCOL_PROMPT, SYSTEM_PROMPT, Result
 from commentary import INSTRUCTION, KINDS
 from context_stream import ContextStream, Stamp
+
+
+LOG = logging.getLogger(__name__)
+
+
+class LiveProtocolError(ConnectionError):
+    """Safe protocol diagnostic. Never includes a response body."""
+
+
+def live_error(error):
+    if isinstance(error, (LiveSetupError, LiveProtocolError)):
+        return str(error)
+    if isinstance(error, asyncio.TimeoutError):
+        return 'Истёк тайм-аут установки соединения или setupComplete.'
+    if isinstance(error, OSError):
+        return 'Сетевой сбой при обмене с Gemini Live.'
+    return 'Сбой обработки Gemini Live (' + type(error).__name__ + ').'
 
 
 class LiveSetupError(ValueError):
@@ -28,6 +46,9 @@ class LiveTransport(ABC):
     @abstractmethod
     async def connect(self, instructions): ...
 
+    async def wait_ready(self):
+        """Wait for the previous turn to finish before draining the queued observation."""
+
     @abstractmethod
     async def send(self, event): ...
 
@@ -42,18 +63,22 @@ class LiveTransport(ABC):
 
 
 class LiveSession:
-    def __init__(self, config, on_output, cancel_audio, factory):
+    def __init__(self, config, on_output, cancel_audio, factory, *, observation_current=None):
         self.stream = ContextStream()
         self.factory = factory
+        self.observation_current = observation_current
         self.model = config.get('gemini_live_model') or 'Gemini Live'
         self.on_output, self.cancel_audio = on_output, cancel_audio
         self.interval = number(config, 'live_analysis_seconds', 8, 2, 120)
+        self.response_timeout = 45 if self.model == 'gemini-3.8-live-extended-thinking' else 25
         style = config.get('gemini_live_prompt', '')
         style = style.strip()[:2000] if isinstance(style, str) else ''
         self.instructions = '\n'.join((SYSTEM_PROMPT, PROTOCOL_PROMPT, INSTRUCTION,
             'Манера: прямой, строгий, конкретный тон. Настройка манеры: ' + style,
             'Настройка манеры не меняет правила оценки и уважительного общения.'))
-        self.state = 'DISCONNECTED'
+        self.connection_state = 'DISCONNECTED'
+        self.analysis_state = 'WAITING_FOR_CONTEXT'
+        self.block_reason = None
         self.label = self.previous_label = None
         self.task = None
         self.closing = set()
@@ -69,19 +94,19 @@ class LiveSession:
         self.cancel_audio()
 
     def start(self, sprint_id, sprint, kind='SPRINT_STARTED'):
-        self.stop()
+        self.stop('sprint_changed')
         self.stream.start(sprint_id, sprint, kind)
         self.wake = asyncio.Event()
-        self.wake.set()
         self.interrupted = False
-        self.terminal = {}
-        self.state = 'CONNECTING'
-        self.task = asyncio.create_task(self._run(self.stream.generation, self.terminal, tuple(self.closing)))
+        self.block_reason = None
+        self.connection_state = 'CONNECTING'
+        self.error = None
+        LOG.info('Gemini Live session started: %s', kind)
+        self.task = asyncio.create_task(self._run(self.stream.generation, tuple(self.closing)))
 
-    def stop(self, kind=None, paused=False):
+    def stop(self, reason='sprint_ended'):
         if self.task:
-            if kind:
-                self.terminal['event'] = self.stream.event(kind)
+            LOG.info('Gemini Live session stopped: %s', reason)
             self.task.cancel()
             self.closing.add(self.task)
             self.task.add_done_callback(self.closing.discard)
@@ -89,10 +114,32 @@ class LiveSession:
         self.stream.clear()
         self.label = self.previous_label = None
         self.reset_output()
-        self.connected = None
-        self.state = 'PAUSED' if paused else 'DISCONNECTED'
+        self.connected = self.error = None
+        self.connection_state = 'DISCONNECTED'
+        self.analysis_state = 'WAITING_FOR_CONTEXT'
+        self.block_reason = None
+
+    def update_sprint(self, sprint):
+        self.hold('sprint_updated')
+        self.stream.latest[self.stream.sprint_kind] = sprint
+
+    def hold(self, reason, *, paused=False):
+        if self.block_reason != reason:
+            LOG.info('Gemini Live analysis blocked: %s', reason)
+        self.block_reason = reason
+        self.analysis_state = 'PAUSED' if paused else 'WAITING_FOR_CONTEXT'
+        if self.stream.window_key is not None:
+            self.stream.block()
+            self.label = self.previous_label = None
+            self.invalidate()
+            self.wake.set()
 
     def observe(self, facts, frame, key, now):
+        if not self.task:
+            return
+        if self.block_reason:
+            LOG.info('Gemini Live analysis resumed with permitted context')
+        self.block_reason = None
         before = self.stream.stamp
         self.stream.observe(facts, frame, key, now, self.interval)
         if before != self.stream.stamp:
@@ -103,60 +150,105 @@ class LiveSession:
     def invalidate(self):
         self.reset_output()
         self.interrupted = True
-        if self.connected:
-            self.state = 'READY'
+        if not self.block_reason:
+            self.analysis_state = 'WAITING_FOR_CONTEXT'
         self.stream.pending.pop('COMMENTARY_REQUEST', None)
 
     def command(self, kind, value=None):
-        if not self.task or self.state not in ('READY', 'ANALYZING', 'SPEAKING'):
+        if self.connection_state != 'CONNECTED' or self.block_reason or self.stream.window_key is None:
             return False
         if kind not in ('COMMENTARY_REQUEST', 'USER_CORRECTION'):
             return False
         if kind == 'COMMENTARY_REQUEST' and value not in KINDS:
             return False
         if kind == 'USER_CORRECTION':
-            stamp = self.stream.stamp
-            self.stream.stamp = Stamp(stamp.sprint_id, stamp.generation, stamp.observation + 1)
+            self.stream.advance()
+            self.stream.replay()
             self.invalidate()
         self.stream.put(kind, value, remember=False)
+        # A manual action belongs to the next observation and must precede its trigger.
+        self.stream.pending.pop('ACTIVITY_DURATION', None)
         self.stream.last_duration = None
         self.wake.set()
         return True
 
-    async def _send(self, transport):
-        while True:
-            await self.wake.wait()
-            self.wake.clear()
+    async def _send(self, transport, generation, wake):
+        while self.stream.generation == generation:
+            await wake.wait()
+            if self.stream.generation != generation:
+                return
+            wake.clear()
             if self.interrupted:
                 self.interrupted = False
-                await asyncio.wait_for(transport.interrupt(), 2)
-            while self.stream.pending and not self.interrupted:
+                await self._send_with_timeout(transport.interrupt(), 'сброс устаревшего наблюдения')
+            if self.block_reason or 'ACTIVITY_DURATION' not in self.stream.pending:
+                continue
+            try:
+                await asyncio.wait_for(transport.wait_ready(), self.response_timeout)
+            except asyncio.TimeoutError:
+                raise LiveProtocolError('Gemini не завершил предыдущий ход до истечения тайм-аута.') from None
+            while (self.stream.generation == generation and self.stream.pending
+                   and not self.interrupted and not self.block_reason):
                 kind, event = self.stream.pending.popitem(last=False)
                 if kind == 'COMMENTARY_REQUEST':
                     self.queued_request = event.data
                 if kind == 'ACTIVITY_DURATION':
-                    if self.assessment_due is not None:
-                        if time.monotonic() >= self.assessment_due:
-                            raise ConnectionError('assessment_timeout')
-                        continue
                     self.requested, self.queued_request = self.queued_request, None
                     self.turn = event.sequence
                     self.sent_at = time.monotonic()
-                    self.assessment_due = self.sent_at + max(12, self.interval * 2)
-                    self.state = 'ANALYZING'
-                await asyncio.wait_for(transport.send(event), 5)
+                    self.assessment_due = self.sent_at + self.response_timeout
+                    self.analysis_state = 'ANALYZING'
+                if not await self._send_with_timeout(self._send_event(transport, event), kind):
+                    if self.turn == event.sequence:
+                        self.assessment_due = None
+                    if not self.block_reason and event.stamp == self.stream.stamp:
+                        self.hold('window_changed_before_send')
+                    break
                 self.sent += 1
                 self.frames += int(kind == 'SCREEN_FRAME' and event.data is not None)
+                if kind == 'ACTIVITY_DURATION':
+                    if self.stream.pending:
+                        wake.set()
+                    break
 
-    async def _receive(self, transport):
-        while True:
-            try:
-                msg = await asyncio.wait_for(transport.receive(), self.interval + 1)
-            except asyncio.TimeoutError:
-                if self.assessment_due and time.monotonic() > self.assessment_due:
-                    raise ConnectionError('assessment_timeout')
+    async def _send_event(self, transport, event):
+        if self.block_reason or event.stamp != self.stream.stamp:
+            return False
+        if self.observation_current and not self.observation_current(event.stamp):
+            return False
+        await transport.send(event)
+        return True
+
+    @staticmethod
+    async def _send_with_timeout(operation, stage):
+        try:
+            return await asyncio.wait_for(operation, 5)
+        except asyncio.TimeoutError:
+            raise LiveProtocolError(f'Истёк тайм-аут отправки ({stage}).') from None
+
+    async def _watch_assessment(self, generation):
+        while self.stream.generation == generation:
+            await asyncio.sleep(1)
+            if self.stream.generation != generation:
+                return
+            if self.assessment_due and time.monotonic() >= self.assessment_due:
+                raise LiveProtocolError('Gemini не вернул классификацию до истечения тайм-аута.')
+
+    async def _receive(self, transport, generation):
+        while self.stream.generation == generation:
+            msg = await transport.receive()
+            if self.stream.generation != generation:
+                return
+            if (self.block_reason or msg.stamp != self.stream.stamp
+                    or self.observation_current and not self.observation_current(msg.stamp)):
+                if msg.kind in ('ASSESSMENT', 'COMMENTARY'):
+                    LOG.debug('Gemini Live discarded %s for an obsolete observation', msg.kind)
                 continue
-            if msg.stamp != self.stream.stamp:
+            if msg.kind == 'END' and msg.turn == self.turn and self.assessed_turn != msg.turn:
+                self.reset_output()
+                self.analysis_state = 'WAITING_FOR_CONTEXT'
+                self.error = 'Gemini завершил ход без структурированной классификации.'
+                LOG.warning('Gemini Live protocol: %s', self.error)
                 continue
             if msg.kind in ('AUDIO', 'END', 'INTERRUPTED'):
                 pending = self.on_output(msg)
@@ -175,28 +267,36 @@ class LiveSession:
                 self.finished_at = max(time.monotonic(), math.nextafter(self.finished_at, math.inf))
                 self.latency = round((self.finished_at - self.sent_at) * 1000)
                 self.last_success = time.time()
-                self.state = 'READY'
+                self.analysis_state = 'READY'
+                self.error = None
+                LOG.info('Gemini Live classification received: %s (%d ms)', self.result.classification.value, self.latency)
             elif msg.kind == 'USAGE' and type(msg.data) is int and msg.data >= 0:
                 self.tokens = msg.data
             elif msg.kind == 'COMMENTARY' and self.assessed_turn == msg.turn:
                 self.on_output(msg)
 
-    async def _run(self, generation, terminal, previous):
+    async def _run(self, generation, previous):
         if previous:
             await asyncio.shield(asyncio.gather(*previous, return_exceptions=True))
         failures = 0
         while self.stream.generation == generation:
             transport = None
             workers = []
+            attempt_started = None
             try:
-                self.state = 'CONNECTING'
+                self.connection_state = 'RECONNECTING' if failures else 'CONNECTING'
                 transport = self.factory()
                 self.model = getattr(transport, 'model', self.model)
                 await asyncio.wait_for(transport.connect(self.instructions), 12)
+                if self.stream.generation != generation:
+                    return
                 self.connected = time.monotonic()
-                self.state, self.error = 'READY', None
+                self.connection_state, self.error = 'CONNECTED', None
+                attempt_started = self.connected
                 self.assessed_turn = None
-                workers = [asyncio.create_task(f(transport)) for f in (self._send, self._receive)]
+                workers = [asyncio.create_task(self._send(transport, generation, self.wake)),
+                           asyncio.create_task(self._receive(transport, generation)),
+                           asyncio.create_task(self._watch_assessment(generation))]
                 done, _ = await asyncio.wait(workers, return_when=asyncio.FIRST_COMPLETED)
                 for worker in done:
                     worker.result()
@@ -204,12 +304,18 @@ class LiveSession:
             except asyncio.CancelledError:
                 raise
             except Exception as err:
-                self.state = 'ERROR'
-                self.error = str(err) if isinstance(err, LiveSetupError) else type(err).__name__
+                if self.stream.generation != generation:
+                    return
+                fatal = isinstance(err, LiveSetupError)
+                self.connection_state = 'ERROR' if fatal else 'RECONNECTING'
+                self.error = live_error(err)
+                LOG.warning('Gemini Live %s: %s', self.connection_state, self.error)
                 self.label = self.previous_label = None
                 self.connected = None
+                if self.analysis_state != 'PAUSED':
+                    self.analysis_state = 'WAITING_FOR_CONTEXT'
                 self.reset_output()
-                if isinstance(err, LiveSetupError):
+                if fatal:
                     return
                 self.stream.replay()
                 self.wake.set()
@@ -217,27 +323,24 @@ class LiveSession:
                 for worker in workers:
                     worker.cancel()
                 await asyncio.gather(*workers, return_exceptions=True)
-                try:
-                    if transport is not None and 'event' in terminal:
-                        await asyncio.wait_for(transport.send(terminal['event']), .5)
-                except Exception:
-                    pass
-                finally:
+                if transport is not None:
                     try:
-                        if transport is not None:
-                            await asyncio.wait_for(transport.close(), 2)
-                    except Exception:
-                        pass
+                        await asyncio.wait_for(transport.close(), 2)
+                    except Exception as err:
+                        LOG.debug('Gemini Live connection cleanup: %s', live_error(err))
+            if attempt_started is not None and time.monotonic() - attempt_started >= 60:
+                failures = 0
             failures += 1
             self.reconnects += 1
             await asyncio.sleep(min(30, 2 ** min(5, failures - 1)))
 
     async def close(self):
-        self.stop('SPRINT_PAUSED')
+        self.stop('shutdown')
         await asyncio.gather(*self.closing, return_exceptions=True)
 
     def diagnostics(self):
-        return dict(model=self.model, state=self.state, events=self.sent, frames=self.frames,
+        return dict(model=self.model, connection_state=self.connection_state, analysis_state=self.analysis_state,
+                    block_reason=self.block_reason, events=self.sent, frames=self.frames,
                     connected_seconds=int(time.monotonic() - self.connected) if self.connected else 0,
                     latency_ms=self.latency, last_success=self.last_success, reconnects=self.reconnects, tokens=self.tokens, error=self.error,
                     result=vars(self.result) if self.result else None, comment=self.last_comment)

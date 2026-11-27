@@ -10,6 +10,7 @@ os.environ.setdefault('PYGAME_HIDE_SUPPORT_PROMPT', '1')
 
 from focus_meter import ActivityMonitor, ActivityState as State, DistractionMeter, Foreground, Severity
 from focus_runtime import FocusController, Phase
+from test_live_session import Trace, until
 from voicepack import VoicePackNotifier
 from intervention import ForegroundGuard, InterventionEngine, site_host
 from voicepack import Event
@@ -47,7 +48,7 @@ class FocusContextTests(unittest.IsolatedAsyncioTestCase):
         now = time.monotonic()
         browser = Foreground(7, 1, 'New Tab - Chrome', 'chrome.exe')
         phase = Phase(('s1', 1), 'Report', True, True, False, {'id': 's1', 'state': 'ACTIVE'}, '{"goal":"Report"}')
-        transport = Mock()
+        transport = Mock(side_effect=Trace)
         config = {'focus_meter_enabled': True}
         tracker = FocusController(config, lambda: phase, lambda: True, Mock(), Mock(), Mock(),
                                   notifier=VoicePackNotifier(config), sound_enabled=lambda: True,
@@ -58,8 +59,11 @@ class FocusContextTests(unittest.IsolatedAsyncioTestCase):
             tracker._tick(now + 3)
             self.assertIs(tracker.state, State.UNCERTAIN)
             self.assertEqual(tracker.meter.score, 0)
-            transport.assert_not_called()
+            await until(lambda: tracker.live.session.connection_state == 'CONNECTED')
+            transport.assert_called_once_with()
+            self.assertEqual(tracker.live.session.sent, 0)
         finally:
+            await tracker.live.session.close()
             if tracker.hud:
                 tracker.hud.close()
             if tracker.intervention:

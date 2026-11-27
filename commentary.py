@@ -1,7 +1,10 @@
 """Local admission policy for advisory output. Provider messages have no action capability."""
+import logging
 from collections import deque
 
 from activity_protocol import Classification, Recommendation
+
+LOG = logging.getLogger(__name__)
 
 KINDS = frozenset({'START', 'DEVIATION', 'NEXT_STEP', 'CLARIFY', 'RETURN', 'DIFFICULTY', 'BREAK', 'SUMMARY'})
 INSTRUCTION = (
@@ -44,15 +47,23 @@ class CommentaryGate:
 
     def admit(self, kind, result, now, *, active, current, enabled, busy, confirmed,
               min_confidence, requested=False, returned=False):
-        if (kind not in KINDS or not active or not current or not enabled or busy
-                or now - self.last < self.cooldown or not (requested or self.proactive) or not result):
-            return False
-        if not requested and kind == 'START' and self.started:
-            return False
-        if not requested and kind == 'DEVIATION' and (
-            self.deviations >= self.max_warnings or self.deviations and now - self.last_deviation < self.repeat_interval
-        ):
-            return False
+        checks = (
+            (kind not in KINDS, 'invalid kind'),
+            (not active or not current, 'inactive or stale observation'),
+            (not enabled, 'event disabled'),
+            (busy, 'audio busy'),
+            (now - self.last < self.cooldown, 'cooldown'),
+            (not (requested or self.proactive), 'proactive speech disabled'),
+            (not result, 'classification unavailable'),
+            (not requested and kind == 'START' and self.started, 'start already announced'),
+            (not requested and kind == 'DEVIATION' and (
+                self.deviations >= self.max_warnings or self.deviations and now - self.last_deviation < self.repeat_interval
+            ), 'deviation repeat limit'),
+        )
+        for rejected, reason in checks:
+            if rejected:
+                LOG.debug('Gemini Live commentary rejected: %s', reason)
+                return False
         if kind == 'CLARIFY':
             allowed = (result.classification == Classification.UNCERTAIN
                        and result.recommended_action == Recommendation.REQUEST_CLARIFICATION)
@@ -71,4 +82,6 @@ class CommentaryGate:
             if kind == 'DEVIATION':
                 self.deviations += 1
                 self.last_deviation = now
+        else:
+            LOG.debug("Gemini Live commentary rejected: current classification does not allow speech")
         return allowed

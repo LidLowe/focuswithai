@@ -287,7 +287,7 @@ class StartupOrchestrator:
             self.tray.update('error' if self.backend is None else 'loading',
                              'Dashboard недоступен' if self.backend is None else 'запуск Dashboard', '—')
             return
-        live = ((state.get('focus') or {}).get('live_engine') or {}).get('state', 'DISCONNECTED')
+        live = ((state.get('focus') or {}).get('live_engine') or {}).get('connection_state', 'DISCONNECTED')
         sprint = (state.get('sprint') or {}).get('state')
         label = {'BREAK': 'перерыв', 'PAUSED': 'возобнови спринт', 'ACTIVE': 'спринт идёт'}.get(sprint, 'начни спринт')
         icon = 'limited' if live == 'ERROR' else 'ready' if sprint == 'ACTIVE' else 'paused'

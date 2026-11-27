@@ -1,12 +1,15 @@
 """Bridge the duplex transport to the existing decision policy and audio coordinator."""
+import logging
 import time
 
-from activity_context import clean
+from activity_context import clean, sprint_context
 from commentary import CommentaryGate
 from live_audio import LiveAudio
 from gemini_live import DEFAULTS, GeminiLiveTransport
 from live_session import LiveSession, number
 from voicepack import Event
+
+LOG = logging.getLogger(__name__)
 
 ALARMS = dict(START=Event.SESSION_START, DEVIATION=Event.DISTRACTION, NEXT_STEP=Event.ATTENTION,
               CLARIFY=Event.ATTENTION, RETURN=Event.RETURN_TO_WORK, DIFFICULTY=Event.FOCUS_WARNING,
@@ -19,18 +22,32 @@ class LiveFocus:
         volume = number(config, 'live_volume', .55, 0, 1)
         self.audio = LiveAudio(notifier.player, volume)
         self.session = LiveSession({**DEFAULTS, **config}, self.output, self.audio.cancel,
-                                   transport_factory or (lambda: GeminiLiveTransport(config)))
+                                   transport_factory or (lambda: GeminiLiveTransport(config)),
+                                   observation_current=self.current)
         self.gate = CommentaryGate(config, number(config, 'focus_cooldown_seconds', 45, 15, 300))
         self.allow_images = config.get('activity_send_remote_images') is True
         self.focus_audio = config.get('focus_audio', True)
 
-        self.next_start = 'SPRINT_STARTED'
+        self.sprint_context = None
         self.pending_request = None
 
-    def stop(self, kind=None, paused=False, *, keep_request=False):
-        self.session.stop(kind, paused)
-        if not keep_request:
+    def sync_phase(self, phase, reason='sprint_ended'):
+        stamp = self.session.stream.stamp
+        if not phase.sprint:
+            if self.session.task:
+                self.session.stop(reason)
+                self.pending_request = self.sprint_context = None
+        elif phase.active:
+            if stamp is None or stamp.sprint_id != phase.sprint['id']:
+                self.session.start(phase.sprint['id'], sprint_context(phase.context))
+            elif phase.context != self.sprint_context:
+                self.session.update_sprint(sprint_context(phase.context))
+            self.sprint_context = phase.context
+        elif phase.sprint['state'] in ('PAUSED', 'BREAK'):
+            self.session.hold(phase.sprint['state'].lower(), paused=True)
             self.pending_request = None
+        else:
+            self.session.hold('sprint_inactive', paused=True)
 
     def request(self, kind):
         if not self.sound_allowed():
@@ -42,7 +59,7 @@ class LiveFocus:
         acq = self.owner.acquisition
         browser = acq.context.browser
         signature = (phase.context, acq.context.window, (browser['domain'], browser['title']) if browser else None)
-        return (phase.active and self.owner.use_ai() and self.owner.phase_key == phase.key
+        return (phase.active and not self.session.block_reason and self.owner.use_ai() and self.owner.phase_key == phase.key
                 and stamp == self.session.stream.stamp and signature == self.owner.signature
                 and signature == self.session.stream.window_key
                 and acq.foreground_is_current())
@@ -55,9 +72,6 @@ class LiveFocus:
     def sample(self, now, phase, key, facts, frame):
         session = self.session
         self.gate.observe(phase.key, session.result.classification if session.result else None)
-        if not session.task:
-            session.start(phase.sprint['id'], facts['sprint'], self.next_start)
-            self.next_start = 'SPRINT_UPDATED'
         facts['recent_warnings'] = [
             {'kind': kind, 'seconds_ago': round(now - at)}
             for at, kind in self.gate.warnings if now - at < 180
@@ -67,10 +81,6 @@ class LiveFocus:
             kind, expires = self.pending_request
             if now >= expires or session.command('COMMENTARY_REQUEST', kind):
                 self.pending_request = None
-        if self.audio.busy and session.state == 'READY':
-            session.state = 'SPEAKING'
-        if session.state == 'SPEAKING' and not self.audio.busy:
-            session.state = 'READY'
         if now - session.finished_at <= 2 * session.interval + 2:
             return session.result
         return None
@@ -80,6 +90,8 @@ class LiveFocus:
         response = (msg.stamp, msg.turn, msg.response_id)
         if not self.current(msg.stamp) or not self.sound_allowed():
             self.audio.cancel()
+            if msg.kind == 'COMMENTARY':
+                LOG.debug('Gemini Live commentary rejected: stale context or audio disabled')
             return
         if msg.kind == 'INTERRUPTED':
             if self.audio.response == response:
@@ -91,17 +103,21 @@ class LiveFocus:
         elif msg.kind == 'COMMENTARY':
             data = msg.data
             if not isinstance(data, dict) or not isinstance(msg.response_id, str) or not 0 < len(msg.response_id) <= 128:
+                LOG.debug("Gemini Live commentary rejected: invalid envelope")
                 return
             kind, line = data.get('kind'), clean(data.get('text'), 300)
             if not isinstance(kind, str) or kind not in ALARMS or not line:
+                LOG.debug("Gemini Live commentary rejected: invalid kind or empty text")
                 return
             event = ALARMS[kind]
             now = time.monotonic()
             _, _, confirmed = self.owner.decision.evaluate(now, session.result, session.finished_at, self.owner.signature)
             correction = self.owner.decision.corrected
             if now - session.finished_at > 2 * session.interval + 2:
+                LOG.debug("Gemini Live commentary rejected: classification expired")
                 return
             if correction and correction[0] == self.owner.signature and now < correction[1]:
+                LOG.debug("Gemini Live commentary rejected: user corrected classification")
                 return
             accepted = self.gate.admit(kind, session.result, now, active=True, current=True,
                 enabled=event not in self.notifier.disabled, busy=self.audio.busy or self.notifier.player.busy,
@@ -110,7 +126,6 @@ class LiveFocus:
             session.requested = None
             if accepted:
                 def started():
-                    session.state = 'SPEAKING'
                     session.last_comment = line
                     self.gate.record(time.monotonic(), kind)
                     if self.owner.on_intervention:
@@ -123,8 +138,9 @@ class LiveFocus:
                 async def prelude():
                     await self.notifier.live_alarm(event)
 
-                self.audio.start(response, data.get('rate'), current, prelude, started)
+                if not self.audio.start(response, data.get('rate'), current, prelude, started):
+                    LOG.debug('Gemini Live commentary rejected: audio device busy or invalid format')
 
     def diagnostics(self):
-        return {**self.session.diagnostics(), 'buffer_bytes': self.audio.buffered,
+        return {**self.session.diagnostics(), 'audio_state': self.audio.state, 'buffer_bytes': self.audio.buffered,
                 'audio_dropped': self.audio.dropped, 'audio_error': self.audio.error}
