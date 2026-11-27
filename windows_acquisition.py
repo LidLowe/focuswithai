@@ -8,6 +8,7 @@ import time
 from _ctypes import COMError
 from contextlib import contextmanager, suppress
 from ctypes import wintypes
+from dataclasses import replace
 from hashlib import blake2s
 
 import win32gui
@@ -15,7 +16,7 @@ import win32process
 import win32ui
 from pywintypes import error as WinError
 
-from activity_context import BROWSERS, Frame, Privacy, PRIVATE_TEXT, clean
+from activity_context import Frame, Privacy, PRIVATE_TEXT, clean
 from focus_windows import foreground
 
 
@@ -148,51 +149,31 @@ def window_image(hwnd, width, height):
             win32gui.ReleaseDC(hwnd, window_dc)
 
 
-def capture_window(window, dimensions, quality, browser_check):
+def capture_window(window, dimensions, quality):
+    """Capture the actual foreground HWND using only the Windows graphics API."""
     affinity = wintypes.DWORD()
     if foreground() != window or win32gui.IsIconic(window.handle):
         return None, 'foreground_changed'
     if _affinity(window.handle, ctypes.byref(affinity)) and affinity.value:
         return None, 'protected_window'
 
-    browser = ntpath.basename(window.executable).casefold() in BROWSERS
+    previous_dpi = _thread_dpi(PER_MONITOR_AWARE_V2)
     try:
-        with window_automation(window.handle) as (automation, root, api):
-            if not root:
-                return None, 'uia_unavailable'
-            page = None
-            if browser:
-                page, reason = browser_page(automation, root, api, browser_check, wake_document=True)
-                if reason:
-                    return None, reason
-            if sensitive_controls(automation, root, api):
-                return None, 'sensitive_controls'
-            previous_dpi = _thread_dpi(PER_MONITOR_AWARE_V2)
-            try:
-                left, top, right, bottom = win32gui.GetWindowRect(window.handle)
-                width, height = right - left, bottom - top
-                if min(width, height) < 40 or width * height > 20_000_000:
-                    return None, 'invalid_dimensions'
-                image = window_image(window.handle, width, height)
-            except (OSError, WinError, win32ui.error):
-                return None, 'capture_failed'
-            finally:
-                if previous_dpi:
-                    _thread_dpi(previous_dpi)
-            if foreground() != window:
-                return None, 'foreground_changed'
-            if _affinity(window.handle, ctypes.byref(affinity)) and affinity.value:
-                return None, 'protected_window'
-            if browser:
-                after, reason = browser_page(automation, root, api, browser_check)
-                if reason:
-                    return None, reason
-                if after != page:
-                    return None, 'browser_changed'
-                if sensitive_controls(automation, root, api):
-                    return None, 'sensitive_controls'
-    except (COMError, OSError, ImportError, WinError):
-        return None, 'uia_unavailable'
+        left, top, right, bottom = win32gui.GetWindowRect(window.handle)
+        width, height = right - left, bottom - top
+        if min(width, height) < 40 or width * height > 20_000_000:
+            return None, 'invalid_dimensions'
+        image = window_image(window.handle, width, height)
+    except (OSError, WinError, win32ui.error):
+        return None, 'capture_failed'
+    finally:
+        if previous_dpi:
+            _thread_dpi(previous_dpi)
+    if foreground() != window:
+        return None, 'foreground_changed'
+    if _affinity(window.handle, ctypes.byref(affinity)) and affinity.value:
+        return None, 'protected_window'
+
     image.thumbnail(dimensions)
     if image.width < 40 or image.height < 40:
         return None, 'invalid_dimensions'
@@ -202,7 +183,39 @@ def capture_window(window, dimensions, quality, browser_check):
         return None, 'blank_frame'
     output = io.BytesIO()
     image.convert('RGB').save(output, 'JPEG', quality=quality)
-    return Frame(output.getvalue(), gray.tobytes(), image.width, image.height, time.monotonic(), page), None
+    return Frame(output.getvalue(), gray.tobytes(), image.width, image.height, time.monotonic()), None
+
+
+def capture_browser_window(window, dimensions, quality, browser_check):
+    """Apply browser privacy checks before accepting an ordinary window screenshot."""
+    if foreground() != window:
+        return None, 'foreground_changed'
+    try:
+        with window_automation(window.handle) as (automation, root, api):
+            if not root:
+                return None, 'uia_unavailable'
+            page, reason = browser_page(automation, root, api, browser_check, wake_document=True)
+            if reason:
+                return None, reason
+            if sensitive_controls(automation, root, api):
+                return None, 'sensitive_controls'
+
+            frame, reason = capture_window(window, dimensions, quality)
+            if not frame:
+                return None, reason
+
+            after, reason = browser_page(automation, root, api, browser_check)
+            if reason:
+                return None, reason
+            if after != page:
+                return None, 'browser_changed'
+            if sensitive_controls(automation, root, api):
+                return None, 'sensitive_controls'
+            if foreground() != window:
+                return None, 'foreground_changed'
+            return replace(frame, source_key=page), None
+    except (COMError, OSError, ImportError, WinError):
+        return None, 'uia_unavailable'
 
 
 def user_apps():

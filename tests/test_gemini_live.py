@@ -372,12 +372,17 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
                 tracker = runtime.focus
                 acquisition = tracker.acquisition
 
-                def capture(window, dimensions, quality, allow_address):
-                    assert window in (ide, browser) and allow_address('https://docs.example.org/exercise') is None
+                def capture(window, dimensions, quality):
+                    assert window in (ide, browser)
                     return Frame(chrome_image, b'fingerprint', 320, 160, time.monotonic()), None
+
+                def capture_browser(window, dimensions, quality, allow_address):
+                    assert window == browser and allow_address('https://docs.example.org/exercise') is None
+                    return capture(window, dimensions, quality)
 
                 acquisition.windows = SimpleNamespace(
                     foreground=lambda: foreground, user_apps=lambda: [], capture_window=capture,
+                    capture_browser_window=capture_browser,
                 )
                 tracker.monitor.get_window = lambda: foreground
                 tracker.monitor.get_idle = lambda: 0

@@ -27,12 +27,13 @@ class AcquisitionTests(unittest.IsolatedAsyncioTestCase):
         windows.user_apps.return_value = ['editor.exe', 'demo.exe']
         release = threading.Event()
 
-        def capture(window, dimensions, quality, check):
+        def capture(window, dimensions, quality):
             if window == ide:
                 release.wait(2)
             return Frame(window.executable.encode(), bytes(100), 80, 80, time.monotonic()), None
 
         windows.capture_window.side_effect = capture
+        windows.capture_browser_window.side_effect = lambda window, dimensions, quality, check: capture(window, dimensions, quality)
         source = Acquisition({'activity_excluded_apps': ['excluded.exe'],
                               'context_allowed_apps': ['editor.exe']}, windows)
         source.has_capture = True
@@ -52,7 +53,8 @@ class AcquisitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(source.context.frame.data, chrome.executable.encode())
         self.assertEqual(source.frames_captured, 1)
         self.assertEqual(source.context.user_apps, ['editor.exe'])
-        self.assertEqual(windows.capture_window.call_args.args[1:3], ((1280, 720), 80))
+        windows.capture_window.assert_called_once_with(ide, (1280, 720), 80)
+        self.assertEqual(windows.capture_browser_window.call_args.args[:3], (chrome, (1280, 720), 80))
         source.sample(now + .4, excluded)
         self.assertIsNone(source.context.frame)
         self.assertIsNone(source.capture_job)
@@ -68,7 +70,7 @@ class AcquisitionTests(unittest.IsolatedAsyncioTestCase):
         now = time.monotonic()
         first = Frame(b'jpeg', bytes(100), 80, 80, now - 60)
         refreshed = Frame(b'jpeg', bytes(100), 80, 80, now)
-        windows.capture_window.return_value = refreshed, None
+        windows.capture_browser_window.return_value = refreshed, None
         source = Acquisition({}, windows)
         source.has_capture = True
         source.start_capture('sprint')
@@ -127,7 +129,7 @@ class ChromeCaptureTests(unittest.TestCase):
     def test_browser_capture_checks_privacy_before_and_after_the_image(self):
         from PIL import Image
         from activity_context import Privacy
-        from windows_acquisition import capture_window
+        from windows_acquisition import capture_browser_window
 
         chrome = Foreground(5, 6, 'Work fixture - Google Chrome', r'C:\Chrome\chrome.exe')
         privacy = Privacy({})
@@ -144,7 +146,7 @@ class ChromeCaptureTests(unittest.TestCase):
               patch('windows_acquisition.browser_page') as read_page,
               patch('windows_acquisition.window_image', return_value=image) as grab):
             def capture():
-                return capture_window(chrome, (80, 80), 72, privacy.browser_capture_reason)
+                return capture_browser_window(chrome, (80, 80), 72, privacy.browser_capture_reason)
 
             for reason in ('browser_mode_unverified', 'sensitive_page'):
                 read_page.return_value = None, reason
@@ -181,7 +183,7 @@ class ChromeCaptureTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform == 'win32', 'uses the Windows capture adapter')
     def test_unavailable_uia_skips_image_before_capture(self):
         from activity_context import Privacy
-        from windows_acquisition import capture_window
+        from windows_acquisition import capture_browser_window
 
         chrome = Foreground(5, 6, 'Work fixture - Google Chrome', r'C:\Chrome\chrome.exe')
         with (patch('windows_acquisition.foreground', return_value=chrome),
@@ -189,8 +191,39 @@ class ChromeCaptureTests(unittest.TestCase):
               patch('windows_acquisition._affinity', return_value=False),
               patch('windows_acquisition.window_automation', side_effect=OSError),
               patch('windows_acquisition.window_image') as grab):
-            self.assertEqual(capture_window(chrome, (80, 80), 72, Privacy({}).browser_capture_reason),
+            self.assertEqual(capture_browser_window(chrome, (80, 80), 72, Privacy({}).browser_capture_reason),
                              (None, 'uia_unavailable'))
+            grab.assert_not_called()
+
+
+    @unittest.skipUnless(sys.platform == 'win32', 'uses the Windows capture adapter')
+    def test_ordinary_window_capture_works_without_uia_and_skips_protected_windows(self):
+        import ctypes
+        from PIL import Image
+        from windows_acquisition import capture_window
+
+        notepad = Foreground(5, 6, 'Notes - Notepad', r'C:\Windows\notepad.exe')
+        image = Image.new('RGB', (80, 80), 'white')
+        image.paste((0, 0, 0), (0, 0, 40, 40))
+
+        def set_affinity(_, output):
+            ctypes.cast(output, ctypes.POINTER(ctypes.c_uint32))[0] = 0x11
+            return True
+
+        with (patch('windows_acquisition.foreground', return_value=notepad),
+              patch('windows_acquisition.win32gui.IsIconic', return_value=False),
+              patch('windows_acquisition.win32gui.GetWindowRect', return_value=(0, 0, 80, 80)),
+              patch('windows_acquisition._affinity', return_value=False) as affinity,
+              patch('windows_acquisition.window_automation', side_effect=OSError) as automation,
+              patch('windows_acquisition.window_image', return_value=image) as grab):
+            frame, reason = capture_window(notepad, (80, 80), 72)
+            self.assertTrue(frame.data.startswith(b'\xff\xd8'))
+            self.assertIsNone(reason)
+            automation.assert_not_called()
+
+            grab.reset_mock()
+            affinity.side_effect = set_affinity
+            self.assertEqual(capture_window(notepad, (80, 80), 72), (None, 'protected_window'))
             grab.assert_not_called()
 
 

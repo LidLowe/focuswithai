@@ -178,8 +178,11 @@ class Acquisition:
             return
         self.job_epoch = self.capture_epoch
         self.next_capture = now + min(120, self.interval * self.capture_backoff)
-        self.capture_job = background(self.windows.capture_window, window, self.dimensions, self.quality,
-                                      self.privacy.browser_capture_reason)
+        if ntpath.basename(window.executable).casefold() in BROWSERS:
+            self.capture_job = background(self.windows.capture_browser_window, window, self.dimensions,
+                                          self.quality, self.privacy.browser_capture_reason)
+        else:
+            self.capture_job = background(self.windows.capture_window, window, self.dimensions, self.quality)
 
     def foreground_is_current(self):
         return not self.windows or self.windows.foreground() == self.context.window
