@@ -28,11 +28,26 @@ class ObservationTests(unittest.TestCase):
         self.assertTrue(privacy.capture_allowed(Foreground(1, 2, 'Lab notes', approved)))
         self.assertFalse(privacy.capture_allowed(Foreground(1, 2, 'Sign in', approved)))
         self.assertFalse(privacy.capture_allowed(Foreground(1, 2, 'Private document', approved)))
-        self.assertFalse(privacy.capture_allowed(Foreground(1, 2, 'Lab notes', r'C:\Chrome\chrome.exe')))
+        self.assertTrue(privacy.capture_allowed(Foreground(1, 2, 'Lab notes', r'C:\Chrome\chrome.exe')))
+        self.assertFalse(privacy.capture_allowed(Foreground(1, 2, 'Lab notes - Incognito', r'C:\Chrome\chrome.exe')))
         self.assertTrue(privacy.excluded(Foreground(1, 2, 'Chat', 'signal.exe')))
         self.assertEqual(privacy.browser('api.docs.example.org', 'VLAN docs')['domain'], 'api.docs.example.org')
         self.assertIsNone(privacy.browser('notdocs.example.org', 'VLAN docs'))
         self.assertIsNone(privacy.browser('docs.example.org', 'Banking password'))
+
+    def test_chrome_address_privacy_works_without_extension(self):
+        privacy = Privacy({})
+        self.assertTrue(privacy.browser_capture_allowed('docs.example.org/reference'))
+        self.assertTrue(privacy.browser_capture_allowed('http://localhost:3000/work'))
+        for address in ('', 'chrome://settings', 'file:///C:/example.html', 'https://user@example.org/',
+                        'https://example.org/oauth/start', 'https://example.org/sign%2Din',
+                        'https://our-bank.example.org/', 'https://example.org/?access_token=fixture',
+                        'https://example.org/checkout'):
+            with self.subTest(address=address):
+                self.assertFalse(privacy.browser_capture_allowed(address))
+        scoped = Privacy({'browser_context_domains': ['docs.example.org']})
+        self.assertTrue(scoped.browser_capture_allowed('https://api.docs.example.org/reference'))
+        self.assertFalse(scoped.browser_capture_allowed('https://notdocs.example.org/reference'))
 
     def test_rolling_history_sanitization_and_image_deduplication(self):
         context = ContextAggregator(Privacy({}))

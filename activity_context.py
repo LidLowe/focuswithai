@@ -1,10 +1,12 @@
 """Bounded local observation history and privacy filters for classification."""
 
+import ipaddress
 import json
 import ntpath
 import re
 from collections import deque
 from dataclasses import dataclass
+from urllib.parse import unquote, urlsplit
 
 from focus_meter import Foreground
 
@@ -33,6 +35,7 @@ CONTEXT_DEFAULTS = {
 
 BROWSERS = frozenset(('chrome.exe', 'msedge.exe', 'firefox.exe', 'brave.exe', 'opera.exe',
                       'vivaldi.exe', 'chromium.exe', 'arc.exe', 'waterfox.exe', 'librewolf.exe'))
+CHROME = 'chrome.exe'
 PRIVATE_APPS = frozenset(('credentialuibroker.exe', 'logonui.exe', 'lockapp.exe', 'keepass.exe',
                           'keepassxc.exe', '1password.exe', 'bitwarden.exe', 'telegram.exe',
                           'discord.exe', 'signal.exe', 'whatsapp.exe', 'slack.exe', 'teams.exe',
@@ -41,6 +44,10 @@ PRIVATE_TEXT = re.compile(
     r'\b(passwords?|passcodes?|sign[ -]?in|log[ -]?in|bank(?:ing)?|payment|wallet|'
     r'private browsing|incognito|inprivate|credentials?|inbox|webmail|direct messages?|'
     r'парол\w*|банк\w*|плат[её]ж\w*|авторизаци\w*|вход|инкогнито|переписк\w*)\b', re.I,
+)
+PRIVATE_BROWSER_TEXT = re.compile(
+    r'\b(?:guest(?: mode)?|auth|oauth2?|sso|accounts?|checkout|billing|mail|token|otp|'
+    r'one time code|verification code|credit card|guest session|гостев\w*|секрет\w*|код подтверждения)\b', re.I,
 )
 SECRET = re.compile(r'\b(?:sk-[a-zA-Z0-9_-]{12,}|AIza[\w-]{30,}|AQ\.[\w-]{20,}|gh[pousr]_[\w]{20,}|'
                     r'eyJ[\w-]+\.eyJ[\w-]+\.[\w-]+|(?:api[_ -]?key|token|secret|password)'
@@ -97,18 +104,44 @@ class Privacy:
 
     def capture_allowed(self, window):
         executable = window.executable.casefold()
+        name = ntpath.basename(executable)
         return (window.handle and bool(ntpath.splitdrive(executable)[0]) and ntpath.isabs(executable)
-                and ntpath.basename(executable).endswith('.exe') and executable in self.capture_apps
-                and ntpath.basename(executable) not in BROWSERS
+                and name.endswith('.exe') and executable in self.capture_apps
+                and (name not in BROWSERS or name == CHROME)
                 and not self.excluded(window))
+
+    @staticmethod
+    def sensitive_page(text):
+        text = re.sub(r'[._/=?&%#-]+', ' ', unquote(text))
+        return bool(PRIVATE_TEXT.search(text) or PRIVATE_BROWSER_TEXT.search(text))
+
+    def browser_capture_allowed(self, address):
+        if not address or any(char.isspace() for char in address):
+            return False
+        # Chrome hides the scheme in the unfocused address bar.
+        try:
+            page = urlsplit(address if '://' in address else 'https://' + address)
+            domain = (page.hostname or '').rstrip('.')
+        except ValueError:
+            return False
+        if domain != 'localhost' and not DOMAIN.fullmatch(domain):
+            try:
+                ipaddress.ip_address(domain)
+            except ValueError:
+                return False
+        return (page.scheme in ('http', 'https') and page.username is None and page.password is None and not self.sensitive_page(address)
+                and (not self.domains or self._matches_domain(domain)))
+
+    def _matches_domain(self, domain):
+        return any(domain == entry or domain.endswith('.' + entry) for entry in self.domains)
 
     def browser(self, domain, title):
         if not isinstance(domain, str) or not isinstance(title, str):
             return None
         domain = domain.casefold().strip('.')
-        if (not DOMAIN.fullmatch(domain) or PRIVATE_TEXT.search(domain.replace('.', ' '))
-                or PRIVATE_TEXT.search(title) or any(term in title.casefold() for term in self.windows)
-                or not any(domain == entry or domain.endswith('.' + entry) for entry in self.domains)):
+        if (not DOMAIN.fullmatch(domain) or self.sensitive_page(domain)
+                or self.sensitive_page(title) or any(term in title.casefold() for term in self.windows)
+                or not self._matches_domain(domain)):
             return None
         return {'domain': domain, 'title': clean(title)}
 
@@ -129,8 +162,7 @@ class ContextAggregator:
         self.decisions = deque(maxlen=5)
         self.window = Foreground()
         self.entered = 0.0
-        self.frame = None
-        self.sent_frame = None
+        self.frame = self.sent_frame = self.frame_checked_at = None
         self.browser = None
         self.media = None
         self.user_apps = []
@@ -142,11 +174,16 @@ class ContextAggregator:
                     and (old_app.casefold() not in BROWSERS or self.browser)):
                 self.switches.append((now, clean(old_app, 70), round(now - self.entered)))
             self.entered, self.window = now, window
-            self.frame = self.sent_frame = None
+            self.frame = self.sent_frame = self.frame_checked_at = None
             self.browser = None
 
     def decision(self, now, result):
         self.decisions.append((now, result.classification.value, round(result.confidence, 2)))
+
+    def current_frame(self, now):
+        if self.frame and now - (self.frame_checked_at or self.frame.captured_at) < 60:
+            return self.frame
+        return None
 
     def snapshot(self, now, sprint, score):
         window = self.window
@@ -169,6 +206,5 @@ class ContextAggregator:
                                        for at, label, confidence in self.decisions if now - at < 120],
             'distraction_score': int(score),
         }
-        frame = self.frame if (self.frame and now - self.frame.captured_at < 60
-                               and self.frame.differs(self.sent_frame)) else None
-        return facts, frame
+        frame = self.current_frame(now)
+        return facts, frame if frame and frame.differs(self.sent_frame) else None

@@ -83,7 +83,7 @@ def minimize_if_still_foreground(expected):
     return False
 
 
-def browser_address(expected):
+def browser_address(expected, *, for_capture=False):
     """Read Chrome/Edge's own toolbar, never an input field in the page."""
     if not expected.handle or Path(expected.executable).name.lower() not in BROWSERS:
         return ''
@@ -96,6 +96,14 @@ def browser_address(expected):
         if foreground() != expected:
             return ''
         root = UIAElementInfo(expected.handle)
+        if for_capture:
+            from activity_context import Privacy
+            # Chromium adds the incognito/guest qualifier to the accessible title.
+            # If the accessibility provider cannot confirm a normal window, skip the capture.
+            accessible_title = root.name
+            if (not accessible_title or accessible_title != expected.title
+                    or Privacy.sensitive_page(accessible_title)):
+                return ''
         # Search only browser chrome, skipping page documents and tab contents.
         nodes = [root]
         names = {'address and search bar', 'search or enter web address', 'address bar',

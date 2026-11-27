@@ -266,17 +266,20 @@ class GeminiTransportTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
-    async def run_sprint(self, config, on_complete=None):
+    async def run_sprint(self, config, on_complete=None, *, chrome_image=None):
         # Use the normal Dashboard route, Runtime and focus tick. All foreground data are fixtures.
         with (patch('config_store.load_config', return_value={}), patch('panel.capture_output'),
               patch('logging.basicConfig'), patch('signal.signal')):
             import main
 
         ide = Foreground(1, 2, 'Synthetic programming exercise', 'example-editor.exe')
-        browser = Foreground(2, 3, 'Excluded browser tab fixture', 'chrome.exe')
+        browser = Foreground(2, 3, 'Synthetic programming exercise - Google Chrome', r'C:\Chrome\chrome.exe')
+        protected_tab = Foreground(browser.handle, browser.pid, 'Sign in - Google Chrome', browser.executable)
         private = Foreground(3, 4, 'Excluded application fixture', 'secret-example.exe')
         foreground = ide
         config = {**config, 'activity_excluded_apps': [private.executable], 'focus_meter_enabled': True}
+        if chrome_image:
+            config.update(capture_enabled=True, capture_apps=[browser.executable], activity_send_remote_images=True)
         with tempfile.TemporaryDirectory() as tmp:
             store = SprintManager(Path(tmp) / 'sprints.json')
             with (patch.object(main, 'config', config), patch.object(main, 'SprintManager', return_value=store),
@@ -285,7 +288,18 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
                 runtime.start_focus()
                 runtime.startup_running = True
                 tracker = runtime.focus
-                tracker.acquisition.windows = SimpleNamespace(foreground=lambda: foreground, user_apps=lambda: [])
+                acquisition = tracker.acquisition
+
+                def capture(window, dimensions, quality, allow_address):
+                    assert window == browser and allow_address('https://docs.example.org/exercise')
+                    return Frame(chrome_image, b'fingerprint', 320, 160, time.monotonic())
+
+                acquisition.windows = SimpleNamespace(
+                    foreground=lambda: foreground, user_apps=lambda: [], capture_window=capture,
+                    capture_choices=lambda privacy: [
+                        {'id': '2-3', 'handle': browser.handle, 'pid': browser.pid},
+                    ],
+                )
                 tracker.monitor.get_window = lambda: foreground
                 tracker.monitor.get_idle = lambda: 0
                 session = tracker.live.session
@@ -331,6 +345,39 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(tracker.state.value, 'UNCERTAIN')
                             self.assertIsNone(session.result)
                             self.assertEqual(session.connected, connected_at)
+                            await check_ide()
+                        if chrome_image:
+                            acquisition.has_capture = acquisition.enabled = True
+                            acquisition.arm('2-3')
+                            acquisition.next_capture = 0
+                            foreground = browser
+                            tracker.next_sample = 0
+                            tracker._tick(time.monotonic())
+                            await acquisition.capture_job
+                            acquisition.context.entered -= 3
+                            tracker.live.allow_images = False
+                            tracker._tick(time.monotonic())
+                            self.assertEqual(session.analysis_state, 'WAITING_FOR_CONTEXT')
+                            self.assertIsNone(acquisition.context.browser)
+
+                            previous = session.last_success
+                            tracker.live.allow_images = True
+                            tracker._tick(time.monotonic())
+                            await until(lambda: session.result and session.last_success != previous,
+                                        timeout=session.response_timeout)
+                            self.assertGreater(session.frames, 0)
+                            self.assertEqual(session.connected, connected_at)
+                            self.assertEqual(session.stream.latest['FOREGROUND_CHANGED'], ('chrome.exe', ''))
+                            self.assertIsNone(session.stream.latest['BROWSER_CONTEXT_CHANGED'])
+
+                            foreground = protected_tab
+                            tracker.next_sample = 0
+                            tracker._tick(time.monotonic())
+                            self.assertEqual(session.analysis_state, 'WAITING_FOR_CONTEXT')
+                            self.assertEqual(session.connected, connected_at)
+                            self.assertIsNone(acquisition.context.frame)
+                            self.assertIsNone(session.stream.latest.get('SCREEN_FRAME'))
+                            self.assertTrue(acquisition.armed)
                             await check_ide()
                         await command('pause', id=sprint_id)
                         self.assertEqual(session.analysis_state, 'PAUSED')
@@ -390,11 +437,15 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
         async with TestServer(upstream) as server:
             with patch('gemini_live.ENDPOINT', str(server.make_url('/ws'))):
                 await self.run_sprint({'activity_allow_remote': True, 'google_assistant_api_key': 'fixture'},
-                                      on_complete=verify_close)
+                                      on_complete=verify_close, chrome_image=b'fixture JPEG')
         self.assertEqual(handshakes, 1)
-        self.assertEqual(len(requests), 5)
+        self.assertEqual(len(requests), 7)
+        images = [part['inlineData'] for wire in requests for turn in wire['clientContent']['turns']
+                  for part in turn['parts'] if 'inlineData' in part]
+        self.assertEqual(images, [{'mimeType': 'image/jpeg', 'data': base64.b64encode(b'fixture JPEG').decode()}])
         wire_text = json.dumps(requests)
-        self.assertNotIn('Excluded browser tab fixture', wire_text)
+        self.assertNotIn('Synthetic programming exercise - Google Chrome', wire_text)
+        self.assertNotIn('Sign in - Google Chrome', wire_text)
         self.assertNotIn('Excluded application fixture', wire_text)
         self.assertNotIn('secret-example.exe', wire_text)
 
@@ -404,6 +455,13 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
         config = load_config()
         self.assertTrue(config.get('google_assistant_api_key'), 'A saved Gemini API key is required.')
         self.assertTrue(config.get('activity_allow_remote'), 'Text-context permission is required.')
-        await self.run_sprint(config)
+        import io
+        from PIL import Image, ImageDraw
+        image = Image.new('RGB', (320, 160), 'white')
+        ImageDraw.Draw(image).multiline_text((10, 10), 'Synthetic programming exercise\n\ndef example_function():\n    return 42',
+                                            fill='black')
+        output = io.BytesIO()
+        image.save(output, format='JPEG')
+        await self.run_sprint(config, chrome_image=output.getvalue())
         audio = await probe_gemini_live(config, 'audio')
         self.assertTrue(audio['ok'], audio['stages'])

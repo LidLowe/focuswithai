@@ -6,7 +6,7 @@ import ntpath
 import threading
 import time
 
-from activity_context import BROWSERS, ContextAggregator, Privacy, clean, items, setting
+from activity_context import BROWSERS, CHROME, ContextAggregator, Privacy, clean, items, setting
 
 
 def background(function, *args):
@@ -73,14 +73,18 @@ class Acquisition:
         self.armed = False
         self.selected = None
         self.capture_epoch += 1
-        self.context.frame = self.context.sent_frame = None
+        self.context.frame = self.context.sent_frame = self.context.frame_checked_at = None
 
-    def suspend(self):
+    def suspend(self, *, keep_selection=False):
         self.active = False
         if self.apps_job:
             self.apps_job.cancel()
             self.apps_job = None
-        self.stop_capture()
+        if keep_selection:
+            self.capture_epoch += 1
+            self.next_capture = 0
+        else:
+            self.stop_capture()
         self.context.reset()
         if self.media_job:
             self.media_job.cancel()
@@ -144,6 +148,8 @@ class Acquisition:
             self.capture_job = None
             if self.armed and self.job_epoch == self.capture_epoch and self.job_window == window:
                 self.capture_error = error or (None if value else 'window_unavailable')
+                # A successful identical capture keeps the existing frame fresh without re-sending it.
+                self.context.frame_checked_at = value.captured_at if value else None
                 if value and value.differs(self.context.frame):
                     self.context.frame = value
                     self.capture_backoff = 1
@@ -151,6 +157,8 @@ class Acquisition:
                     self.capture_backoff = min(4, self.capture_backoff * 2)
                 if not value:
                     self.context.frame = None
+                    if ntpath.basename(window.executable).casefold() == CHROME:
+                        self.capture_backoff = 1
         if idle or not self.armed or not self.privacy.capture_allowed(window):
             return
         if self.selected is None:
@@ -160,7 +168,13 @@ class Acquisition:
         self.job_window, self.job_epoch = window, self.capture_epoch
         self.next_capture = now + (self.interval if self.mode == 'periodic'
                                    else min(120, self.interval * self.capture_backoff))
-        self.capture_job = background(self.windows.capture_window, window, self.dimensions, self.quality)
+        args = (window, self.dimensions, self.quality)
+        if ntpath.basename(window.executable).casefold() == CHROME:
+            args += (self.privacy.browser_capture_allowed,)
+        self.capture_job = background(self.windows.capture_window, *args)
+
+    def browser_context_available(self, now, *, send_images):
+        return bool(self.context.browser or (send_images and self.armed and self.context.current_frame(now)))
 
     def foreground_is_current(self):
         return not self.windows or self.windows.foreground() == self.context.window

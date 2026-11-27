@@ -106,14 +106,14 @@ class FocusController:
             'warning': bool(engine and engine.current_warning(now)),
         }
 
-    def suspend(self, reason='observation_reset'):
+    def suspend(self, reason='observation_reset', *, keep_selection=False):
         self.live.session.hold(reason)
         if self.confirmed:
             self.stop_audio()
         self.confirmed = False
         if self.intervention:
             self.intervention.clear()
-        self.acquisition.suspend()
+        self.acquisition.suspend(keep_selection=keep_selection)
         self.decision.reset()
         self.signature = self.next_action = None
         self.was_private = False
@@ -219,7 +219,7 @@ class FocusController:
             window, idle = self.sample
             private = self.acquisition.privacy.excluded(window)
             if private and not self.was_private:
-                self.suspend('excluded_window')
+                self.suspend('excluded_window', keep_selection=True)
                 self.sample = window, idle
                 self.next_sample = now + 1
             self.was_private = private
@@ -237,8 +237,8 @@ class FocusController:
                 blocked = ('analysis_disabled', 'Анализ приостановлен.')
             elif private:
                 blocked = ('excluded_window', 'Окно исключено из анализа.')
-            elif browser and not context.browser:
-                blocked = ('browser_tab_not_allowed', 'Вкладка браузера не разрешена.')
+            elif browser and not self.acquisition.browser_context_available(now, send_images=self.live.allow_images):
+                blocked = ('browser_context_unavailable', 'Ожидаю разрешённый кадр Chrome или данные рабочей вкладки.')
             elif idle:
                 blocked = ('idle', 'Давно не было мыши или клавиатуры.')
             elif not window.title:

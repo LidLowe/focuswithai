@@ -631,13 +631,13 @@ PAGES.activity = {
         ${contextNumber('Максимальная ширина, px', 'capture_width', 160, 1600)}
         ${contextNumber('Максимальная высота, px', 'capture_height', 160, 1600)}
         ${contextNumber('Качество JPEG', 'capture_quality', 35, 95)}
-        ${row('Рабочие приложения для захвата', 'Укажи полный путь к EXE. Разрешение применяется после перезапуска.', 'capture_apps',
+        ${row('Рабочие приложения для захвата', 'Укажи полный путь к EXE, в том числе chrome.exe. Разрешение применяется после перезапуска.', 'capture_apps',
           lw('capture_apps', 'rows', { name: 'Путь к EXE', add: 'Добавить приложение' }))}
         ${row('Исключённые приложения', 'Имя EXE или полный путь', 'activity_excluded_apps',
           lw('activity_excluded_apps', 'rows', { name: 'Приложение', add: 'Исключить приложение' }))}
         ${row('Исключённые окна', 'Любой фрагмент заголовка', 'activity_excluded_windows',
           lw('activity_excluded_windows', 'rows', { name: 'Заголовок', add: 'Исключить окно' }))}
-        ${row('Рабочие домены браузера', 'Для каждой вкладки включай передачу кнопкой расширения FocusWithAI.', 'browser_context_domains',
+        ${row('Рабочие домены браузера', 'Если список заполнен, кадры Chrome разрешены только для этих доменов. Расширение отдельно добавляет метаданные вкладки.', 'browser_context_domains',
           lw('browser_context_domains', 'rows', { name: 'Домен', add: 'Добавить домен' }))}
         ${contextFlag('Метаданные медиасеанса Windows', 'media_context_enabled')}
       </section>`;

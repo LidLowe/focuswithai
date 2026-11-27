@@ -12,7 +12,7 @@ import win32process
 from pywintypes import error as WinError
 
 from activity_context import Frame, PRIVATE_TEXT, clean
-from focus_windows import foreground
+from focus_windows import browser_address, foreground
 
 
 _affinity = ctypes.windll.user32.GetWindowDisplayAffinity
@@ -34,8 +34,7 @@ def sensitive_controls(hwnd):
 
         definitions = comtypes.client.GetModule('UIAutomationCore.dll')
         interfaces = comtypes.gen.UIAutomationClient
-        automation = comtypes.CoCreateInstance(interfaces.CUIAutomation().IPersist_GetClassID(),
-                                              interface=interfaces.IUIAutomation)
+        automation = comtypes.client.CreateObject(interfaces.CUIAutomation, interface=interfaces.IUIAutomation)
         focused = automation.GetFocusedElement()
         if not focused or focused.CurrentIsPassword:
             return True
@@ -47,7 +46,7 @@ def sensitive_controls(hwnd):
         comtypes.CoUninitialize()
 
 
-def capture_window(window, dimensions, quality):
+def capture_window(window, dimensions, quality, browser_check=None):
     from PIL import ImageGrab
 
     affinity = wintypes.DWORD()
@@ -55,11 +54,17 @@ def capture_window(window, dimensions, quality):
             (_affinity(window.handle, ctypes.byref(affinity)) and affinity.value)
             or sensitive_controls(window.handle)):
         return None
+    if browser_check is not None:
+        address = browser_address(window, for_capture=True)
+        if not browser_check(address):
+            return None
     left, top, right, bottom = win32gui.GetWindowRect(window.handle)
     if not 0 < (right - left) * (bottom - top) <= 20_000_000:
         return None
     image = ImageGrab.grab(window=window.handle)
     if foreground() != window or sensitive_controls(window.handle):
+        return None
+    if browser_check is not None and browser_address(window, for_capture=True) != address:
         return None
     image.thumbnail(dimensions)
     if image.width < 40 or image.height < 40:
