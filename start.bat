@@ -14,6 +14,7 @@ set "STOP_SERVER_ON_EXIT=1"
 rem ===============================================
 
 cd /d "%~dp0"
+if exist ".runtime\llama\llama-server.exe" if exist ".venv\Scripts\python.exe" goto :startup_manager
 
 rem --- Первый запуск: виртуальное окружение и зависимости ---
 if not exist ".venv\Scripts\python.exe" (
@@ -107,3 +108,8 @@ if "%STARTED_SERVER%"=="1" if "%STOP_SERVER_ON_EXIT%"=="1" (
     powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='llama-server.exe'\" | Where-Object { $_.CommandLine -match '--port %PORT%' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
 )
 endlocal
+exit /b
+
+:startup_manager
+".venv\Scripts\python.exe" launcher.py %*
+exit /b %errorlevel%

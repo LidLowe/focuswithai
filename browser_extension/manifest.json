@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "FocusWithAI Tab Context",
+  "version": "1.0.0",
+  "description": "Share the active work tab title and domain with FocusWithAI on localhost.",
+  "incognito": "not_allowed",
+  "permissions": ["activeTab", "scripting", "storage", "alarms"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "action": {"default_title": "Share this work tab with FocusWithAI"},
+  "background": {"service_worker": "worker.js"}
+}

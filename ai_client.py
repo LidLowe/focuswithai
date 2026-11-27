@@ -37,6 +37,10 @@ def assistant_name(config: Dict[str, Any]) -> str:
 class AIError(Exception):
     """Ошибка генерации ответа"""
 
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
 
 # llama.cpp: exceed_context_size_error, OpenAI: context_length_exceeded,
 # Ollama/vLLM/прочие: "maximum context length", "too many tokens"
@@ -78,15 +82,14 @@ class AIClient(ABC):
         last_error: Optional[Exception] = None
         for attempt in range(self.retries + 1):
             try:
-                async with session.post(url, json=payload, headers=headers) as response:
+                async with session.post(url, json=payload, headers=headers, allow_redirects=False) as response:
                     if response.status == 200:
                         return await response.json(content_type=None)
-                    body = (await response.text())[:500]
-                    last_error = AIError(f"{self.name}: HTTP {response.status}: {body}")
+                    last_error = AIError(f"{self.name}: HTTP {response.status}", response.status)
                     if response.status not in RETRY_STATUSES:
                         break
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                last_error = AIError(f"{self.name}: сетевая ошибка: {e!r}")
+                last_error = AIError(f"{self.name}: сетевая ошибка: {type(e).__name__}")
 
             if attempt < self.retries:
                 delay = 2 ** attempt + random.random()
@@ -228,7 +231,7 @@ class OpenAICompatibleClient(AIClient):
             choice = result["choices"][0]
             message = choice["message"]
         except (KeyError, IndexError, TypeError):
-            raise AIError(f"{self.name}: неожиданный формат ответа: {str(result)[:300]}")
+            raise AIError(f"{self.name}: неожиданный формат ответа")
         content = (message.get("content") or "").strip()
         if not content and message.get("reasoning_content"):
             # Рассуждающая модель потратила весь лимит на размышления

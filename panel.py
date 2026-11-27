@@ -15,7 +15,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import sys
 import threading
 import time
@@ -25,6 +24,13 @@ from typing import Any, Dict, List, Optional
 
 import aiohttp
 from aiohttp import web
+from audio_import import save_clip
+from activity_context import CONTEXT_DEFAULTS
+from config_store import SECRET_KEYS, VERSION, load_config, public_config, save_config
+from focus_meter import FOCUS_DEFAULTS
+from startup_manager import STARTUP_DEFAULTS, StartupTask
+from voicepack import (AlarmEngine, ClipPlayer, DEFAULTS as VOICEPACK_DEFAULTS, Event, MAX_CLIP_BYTES,
+                       PlaybackStopped, VoicePackCatalog, VoicePackEngine, notification_mode)
 
 CONFIG_FILE = 'config.json'
 SESSIONS_FILE = 'sessions.jsonl'
@@ -39,7 +45,6 @@ DEFAULT_PORT = 8765
 RESTART_CODE = 75
 
 # Ключи API в панель не отдаются, вместо них приходит маска
-SECRET_KEYS = ('api_key', 'openai_api_key', 'google_assistant_api_key')
 MASK = '••••••••'
 
 TTS_ENGINES = ('silero', 'edge', 'piper', 'sapi')
@@ -139,11 +144,6 @@ def write_json_atomic(path: str, data: Any, indent: int = 4):
     write_text_atomic(path, json.dumps(data, ensure_ascii=False, indent=indent) + '\n')
 
 
-def load_config() -> Dict[str, Any]:
-    with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-        return json.load(f)
-
-
 def mask_config(config: Dict[str, Any]) -> Dict[str, Any]:
     masked = copy.deepcopy(config)
     for key in SECRET_KEYS:
@@ -190,7 +190,7 @@ def backup_config():
     while os.path.exists(path):
         n += 1
         path = os.path.join(BACKUP_DIR, f'config-{stamp}-{n}.json')
-    shutil.copy2(CONFIG_FILE, path)
+    write_json_atomic(path, public_config(read_json(CONFIG_FILE, {}) or {}))
     for old in list_backups()[BACKUPS_KEPT:]:
         try:
             os.remove(os.path.join(BACKUP_DIR, old['name']))
@@ -207,8 +207,10 @@ def list_backups() -> List[Dict[str, Any]]:
 
 
 def write_config(config: Dict[str, Any]):
+    if type(config.get('schema_version', VERSION)) is not int or config.get('schema_version', VERSION) != VERSION:
+        raise ValueError('Неподдерживаемая версия конфигурации.')
     backup_config()
-    write_json_atomic(CONFIG_FILE, config)
+    save_config(config)
 
 
 def read_sessions() -> List[Dict[str, Any]]:
@@ -316,6 +318,12 @@ def defaults_for(config: Dict[str, Any]) -> Dict[str, Any]:
         'piper_length_scale': 1.0,
         'sapi_voice': 'Irina',
         'sapi_rate': 0,
+        **VOICEPACK_DEFAULTS,
+        **FOCUS_DEFAULTS,
+        **CONTEXT_DEFAULTS,
+        'schema_version': VERSION,
+        **STARTUP_DEFAULTS,
+        'notification_mode': notification_mode(config),
         'panel_enabled': True,
         'panel_port': DEFAULT_PORT,
         'panel_open_browser': False,
@@ -391,17 +399,6 @@ def engine_status(name: str, config: Dict[str, Any]) -> Dict[str, Any]:
     return {'ok': False, 'note': 'неизвестный движок'}
 
 
-async def play_audio(data: bytes, volume: float = 1.0):
-    import pygame
-    if not pygame.mixer.get_init():
-        pygame.mixer.init(frequency=48000, size=-16, channels=2, buffer=2048)
-    sound = pygame.mixer.Sound(file=io.BytesIO(data))
-    sound.set_volume(max(0.0, min(1.0, volume)))
-    channel = sound.play()
-    while channel is not None and channel.get_busy():
-        await asyncio.sleep(0.1)
-
-
 # ---------- сервер ----------
 
 def _json(data: Any, status: int = 200) -> web.Response:
@@ -429,11 +426,22 @@ class Panel:
         self.rt = runtime
         self._engines: Dict[tuple, Any] = {}
         self._tts_lock = asyncio.Lock()
+        notifier = runtime.voicepack if runtime else None
+        self._player = notifier.player if notifier else ClipPlayer()
+        self._voicepacks = notifier.engine if notifier else VoicePackEngine(VoicePackCatalog(), self._player)
+        self._alarms = notifier.alarms if notifier else AlarmEngine(self._player)
         self.app = web.Application(middlewares=[self._guard], client_max_size=20 * 1024 * 1024)
         r = self.app.router
         r.add_get('/', self.index)
         r.add_static('/static/', WEB_DIR)
         r.add_get('/api/status', self.status)
+        r.add_get('/api/activity/preview', self.context_preview)
+        r.add_post('/api/activity/preview', self.context_preview)
+        r.add_post('/api/activity/browser', self.browser_event)
+        r.add_get('/api/sprints', self.get_sprints)
+        r.add_post('/api/sprints', self.sprint_command)
+        r.add_get('/api/startup', self.startup_status)
+        r.add_post('/api/startup', self.set_startup)
         r.add_get('/api/config', self.get_config)
         r.add_put('/api/config', self.put_config)
         r.add_get('/api/sessions', self.get_sessions)
@@ -449,6 +457,12 @@ class Panel:
         r.add_get('/api/export', self.export)
         r.add_get('/api/windows', self.windows)
         r.add_get('/api/tts', self.tts_status)
+        r.add_get('/api/voicepacks', self.voicepacks)
+        r.add_post('/api/test/voicepack', self.test_voicepack)
+        r.add_get('/api/audio/packs', self.audio_packs)
+        r.add_post('/api/audio/preview', self.audio_preview)
+        r.add_post('/api/audio/import', self.audio_import)
+        r.add_post('/api/audio/stop', self.audio_stop)
         r.add_post('/api/test/tts', self.test_tts)
         r.add_post('/api/test/sound', self.test_sound)
         r.add_post('/api/test/ai', self.test_ai)
@@ -477,6 +491,19 @@ class Panel:
         if not self.rt:
             raise ValueError('Трекер не запущен: запусти start.bat или python main.py')
         return self.rt
+
+    @_handler
+    async def startup_status(self, request):
+        if sys.platform != 'win32':
+            return _json({'supported': False})
+        return _json(await asyncio.to_thread(StartupTask().status))
+
+    @_handler
+    async def set_startup(self, request):
+        enabled = (await self._body(request)).get('enabled')
+        if sys.platform != 'win32' or type(enabled) is not bool:
+            raise ValueError('Задание автозапуска можно включить или выключить в Windows.')
+        return _json(await asyncio.to_thread(StartupTask().set_enabled, enabled))
 
     async def _body(self, request) -> Dict[str, Any]:
         data = await request.json()
@@ -533,6 +560,39 @@ class Panel:
         return _json({'ok': True})
 
     @_handler
+    async def context_preview(self, request):
+        focus = self._live().focus
+        return _json({'preview': focus.context_preview(request.method == 'POST') if focus else None})
+
+    @_handler
+    async def browser_event(self, request):
+        if not (request.headers.get('Origin', '').startswith('chrome-extension://')
+                and request.headers.get('X-FocusWithAI-Browser') == '1'):
+            return web.Response(status=403)
+        focus = self._live().focus
+        data = await self._body(request)
+        active = bool(focus and focus.phase().active and focus.acquisition.privacy.domains)
+        if active and not data.get('check'):
+            focus.acquisition.browser_event(data, time.monotonic())
+        return _json({'ok': True, 'active': active})
+
+    @_handler
+    async def get_sprints(self, request):
+        return _json(self._live().sprints.snapshot())
+
+    @_handler
+    async def sprint_command(self, request):
+        rt = self._live()
+        body = await self._body(request)
+        action = body.get('action')
+        if not isinstance(action, str):
+            raise ValueError('Укажи действие со спринтом.')
+        if not rt.startup_running:
+            raise ValueError('Подожди, пока трекер завершит запуск.')
+        item = rt.sprint_command(action, body)
+        return _json({'ok': True, 'item': item, **rt.sprints.snapshot()})
+
+    @_handler
     async def process(self, request):
         rt = self._live()
         action = (await self._body(request)).get('action')
@@ -585,10 +645,8 @@ class Panel:
     async def put_sessions(self, request):
         body = await self._body(request)
         write_sessions(body.get('sessions'))
-        if self.rt:
-            self.rt.reload_sessions()
         logging.info('[PANEL] sessions.jsonl сохранён')
-        return _json({'sessions': read_sessions(), 'applied': self.rt is not None})
+        return _json({'sessions': read_sessions()})
 
     # --- файлы вручную ---
 
@@ -596,12 +654,7 @@ class Panel:
     async def get_raw(self, request):
         name = request.query.get('file')
         if name == 'config':
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                text = f.read()
-            config = json.loads(text)
-            for key in SECRET_KEYS:
-                if config.get(key):
-                    text = re.sub(rf'("{key}"\s*:\s*)"(?:[^"\\]|\\.)*"', lambda m: m.group(1) + json.dumps(MASK, ensure_ascii=False), text)
+            text = json.dumps(mask_config(load_config()), ensure_ascii=False, indent=4) + '\n'
             return _json({'text': text, 'lines': text.count('\n') + 1})
         if name == 'sessions':
             text = open(SESSIONS_FILE, 'r', encoding='utf-8').read() if os.path.exists(SESSIONS_FILE) else ''
@@ -621,12 +674,9 @@ class Panel:
                 raise ValueError('config.json должен быть объектом { ... }')
             stored = load_config()
             for key in SECRET_KEYS:
-                if config.get(key) == MASK:
-                    text = re.sub(rf'("{key}"\s*:\s*)"{re.escape(MASK)}"',
-                                  lambda m: m.group(1) + json.dumps(stored.get(key, ''), ensure_ascii=False), text)
-            json.loads(text)
-            backup_config()
-            write_text_atomic(CONFIG_FILE, text if text.endswith('\n') else text + '\n')
+                if key not in config or config.get(key) == MASK:
+                    config[key] = stored.get(key, '')
+            write_config(config)
             logging.info('[PANEL] config.json сохранён вручную')
             return _json(self._config_payload(load_config()))
         if name == 'sessions':
@@ -638,8 +688,6 @@ class Panel:
                     except json.JSONDecodeError as e:
                         raise ValueError(f'Строка {n}: {e.msg}')
             write_sessions(items)
-            if self.rt:
-                self.rt.reload_sessions()
             return _json({'sessions': read_sessions()})
         raise ValueError('Неизвестный файл')
 
@@ -653,10 +701,9 @@ class Panel:
         if not re.fullmatch(r'config-[\d-]+\.json', name):
             raise ValueError('Неверное имя копии')
         path = os.path.join(BACKUP_DIR, name)
-        with open(path, 'r', encoding='utf-8') as f:
-            json.load(f)
-        backup_config()
-        shutil.copy2(path, CONFIG_FILE)
+        saved = public_config(read_json(path))
+        current = load_config()
+        write_config({**saved, **{key: current.get(key, '') for key in SECRET_KEYS}})
         logging.info(f'[PANEL] config.json восстановлен из {name}')
         return _json(self._config_payload(load_config()))
 
@@ -767,6 +814,81 @@ class Panel:
             engines.append(item)
         return _json({'engines': engines})
 
+    @_handler
+    async def voicepacks(self, request):
+        packs = await asyncio.to_thread(self._voicepacks.catalog.list_packs)
+        return _json({'packs': packs})
+
+    @_handler
+    async def audio_packs(self, request):
+        alarms, voices = await asyncio.gather(asyncio.to_thread(self._alarms.catalog.list_packs),
+                                             asyncio.to_thread(self._voicepacks.catalog.list_packs))
+        return _json({'alarm': alarms, 'voice': voices, 'events': [event.value for event in Event]})
+
+    def _pack_engine(self, kind):
+        if kind == 'alarm':
+            return self._alarms
+        if kind == 'voice':
+            return self._voicepacks
+        raise ValueError('Выбери тип пакета: alarm или voice')
+
+    @_handler
+    async def audio_preview(self, request):
+        body = await self._body(request)
+        engine = self._pack_engine(body['kind'])
+        default = 'alarm_volume' if body['kind'] == 'alarm' else 'voicepack_volume'
+        try:
+            await engine.preview(body['pack'], Event(body['event']), body['file'],
+                                 body.get('volume', VOICEPACK_DEFAULTS[default]))
+        except PlaybackStopped:
+            return _json({'ok': True, 'stopped': True})
+        except Exception as error:
+            return _json({'ok': False, 'error': f'Не удалось прослушать файл: {error}'}, 400)
+        return _json({'ok': True})
+
+    @_handler
+    async def audio_import(self, request):
+        query = request.query
+        engine = self._pack_engine(query['kind'])
+        if request.content_length and request.content_length > MAX_CLIP_BYTES:
+            raise ValueError('Аудиофайл превышает 16 МиБ')
+        data = await request.read()
+        try:
+            imported = await asyncio.to_thread(save_clip, engine.catalog, query['pack'], Event(query['event']),
+                                               query['filename'], data)
+        except Exception as error:
+            return _json({'ok': False, 'error': f'Не удалось импортировать файл: {error}'}, 400)
+        return _json({'ok': True, **imported})
+
+    @_handler
+    async def audio_stop(self, request):
+        if self.rt and self.rt.voicepack:
+            self.rt.voicepack.stop_audio()
+        else:
+            import pygame
+            self._player.stop()
+            if pygame.mixer.get_init():
+                pygame.mixer.stop()
+        return _json({'ok': True})
+
+    @_handler
+    async def test_voicepack(self, request):
+        body = await self._body(request)
+        try:
+            await self._voicepacks.preview(body['pack'], Event(body['event']), body['file'],
+                                          body.get('volume', VOICEPACK_DEFAULTS['voicepack_volume']))
+        except PlaybackStopped:
+            return _json({'ok': True, 'stopped': True})
+        except Exception as error:
+            return _json({'ok': False, 'error': f'Не удалось прослушать файл: {error}'}, 400)
+        return _json({'ok': True})
+
+    async def _play_preview(self, data, level=1.0):
+        try:
+            await self._player.play(io.BytesIO(data), level)
+        except PlaybackStopped:
+            pass
+
     def _engine(self, name: str, config: Dict[str, Any]):
         """Движок с настройками черновика; уже загруженная модель берётся повторно"""
         from tts import ENGINES
@@ -804,7 +926,7 @@ class Panel:
                     data, _ = await engine.synthesize(text)
                     seconds = time.monotonic() - started
                     self._engines[key] = engine
-                    await play_audio(data)
+                    await self._play_preview(data)
                     return _json({'ok': True, 'engine': name, 'seconds': round(seconds, 2)})
                 except Exception as e:
                     errors.append(f'{name}: {e!r}'[:300])
@@ -816,7 +938,7 @@ class Panel:
         path = config.get('reminder_sound', 'H_WARNING.mp3')
         with open(path, 'rb') as f:
             data = f.read()
-        await play_audio(data, float(config.get('reminder_volume', 1.0)))
+        await self._play_preview(data, float(config.get('reminder_volume', 1.0)))
         return _json({'ok': True})
 
     @_handler
@@ -930,7 +1052,7 @@ async def start_panel(runtime, config: Dict[str, Any]) -> Optional[web.AppRunner
         logging.error(f"[PANEL] Веб-панель не запущена, порт {port} занят: {e}")
         await runner.cleanup()
         return None
-    url = f'http://127.0.0.1:{port}/'
+    url = f'http://127.0.0.1:{port}/#/sprints'
     print(f"[INFO] Веб-панель: {url}", flush=True)
     if config.get('panel_open_browser'):
         webbrowser.open(url)
