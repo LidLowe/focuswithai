@@ -4,13 +4,14 @@ import asyncio
 import base64
 import json
 import logging
+import time
 from binascii import Error as InvalidBase64
 from collections import deque
 
 import aiohttp
 
 from activity_protocol import RESPONSE_SCHEMA, Result
-from activity_context import clean
+from activity_context import CAPTURE_LIMITS, clean, setting
 from commentary import KINDS
 from live_session import LivePolicyClose, LiveProtocolError, LiveSetupError, LiveTransport, Output
 from performance import TurnTrace, clock
@@ -95,6 +96,8 @@ class GeminiLiveTransport(LiveTransport):
         self.extended = self.model == 'gemini-3.8-live-extended-thinking'
         self.allow_commentary = config.get('live_proactive') is True
         self.allow_images = config.get('activity_send_remote_images') is True
+        capture_interval = CAPTURE_LIMITS['capture_interval']
+        self.refresh_frame_age = setting(config, 'capture_interval', capture_interval['min'], capture_interval['max'])
         self.frame = None
         self.profiler = profiler
         self.profile_frame = self.profile_turn = self.profile_received_ns = None
@@ -202,11 +205,13 @@ class GeminiLiveTransport(LiveTransport):
         if refresh or changed_sprint:
             context[self.sprint_kind] = self.sprint_context
         frame, self.frame = self.frame, None
-        # A context refresh can restore the current observation when acquisition
-        # still considers it valid. It never looks up frames from older observations.
-        refreshed_image = refresh and frame is None and self.allow_images and event.current_frame is not None
+        # A refresh can reuse the current observation only within one capture interval.
+        # Verification of unchanged pixels does not make an old JPEG a new capture.
+        current = event.current_frame
+        refreshed_image = (refresh and frame is None and self.allow_images and current is not None
+                           and 0 <= time.monotonic() - current.captured_at <= self.refresh_frame_age)
         if refreshed_image:
-            frame = event.current_frame
+            frame = current
         if refresh:
             self.current_image_available = frame is not None
         recording = self.profiler.active if self.profiler else None

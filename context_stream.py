@@ -42,7 +42,6 @@ class ContextStream:
         self.latest = {}
         self.pending = OrderedDict()
         self.last_duration = self.last_seen = None
-        self.visual_seen = False
 
     def start(self, sprint_id, sprint, kind='SPRINT_STARTED'):
         self.clear()
@@ -52,7 +51,6 @@ class ContextStream:
 
     def advance(self):
         stamp = self.stamp
-        self.visual_seen = False
         self.stamp = Stamp(stamp.sprint_id, stamp.generation, stamp.observation + 1)
 
     def block(self):
@@ -115,10 +113,9 @@ class ContextStream:
             self.pending.move_to_end('ACTIVITY_DURATION')
         # Give the first capture a short head start. Metadata alone is still
         # enough to start a turn when there is no image or capture times out.
-        first_image = frame is not None and not self.visual_seen
-        self.visual_seen |= frame is not None
-        due = self.last_duration is None or first_image or now - self.last_duration >= interval
-        if (turn_pending and changed) or (not turn_pending and due and not waiting_for_frame):
+        new_frame = frame is not None and 'SCREEN_FRAME' in changed
+        text_due = self.last_duration is None or now - self.last_duration >= interval
+        if (turn_pending and changed) or (not turn_pending and (new_frame or text_due and not waiting_for_frame)):
             self.last_duration = now
             self.put('ACTIVITY_DURATION', facts['activity_seconds'])
             self.put('RECENT_ACTIVITY', {

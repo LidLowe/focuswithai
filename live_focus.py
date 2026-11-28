@@ -77,9 +77,12 @@ class LiveFocus:
             for at, kind in self.gate.warnings if now - at < 180
         ]
         acquisition = self.owner.acquisition
-        waiting_for_frame = (self.allow_images and frame is None and acquisition.capture_job is not None
-                             and acquisition.job_epoch == acquisition.capture_epoch
-                             and now - acquisition.context.entered < 1.25)
+        waiting_for_frame = False
+        if (self.allow_images and acquisition.capture_job is not None
+                and acquisition.job_epoch == acquisition.capture_epoch):
+            capture_started = acquisition.capture_not_before - acquisition.interval
+            waiting_for_frame = (now - capture_started < .65
+                                 or frame is None and now - acquisition.context.entered < 1.25)
         session.observe(facts, frame if self.allow_images else None, key, now,
                         waiting_for_frame=waiting_for_frame)
         if self.pending_request:

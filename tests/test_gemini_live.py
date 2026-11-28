@@ -80,6 +80,12 @@ class GeminiTransportTests(unittest.IsolatedAsyncioTestCase):
         restored = await send_turn(current)
         self.assertTrue(json.loads(restored[0]['text'])['current_image_available'])
         self.assertEqual(base64.b64decode(restored[1]['inlineData']['data']), current.data)
+        transport.refresh_context = True
+        expired = replace(current, captured_at=current.captured_at - 30)
+        without_cached_image = await send_turn(expired)
+        self.assertEqual(len(without_cached_image), 1)
+        self.assertFalse(json.loads(without_cached_image[0]['text'])['current_image_available'])
+
 
     def test_context_budget_checks_order_type_and_preserves_large_instructions(self):
         config = {'activity_allow_remote': True, 'google_assistant_api_key': 'fixture'}

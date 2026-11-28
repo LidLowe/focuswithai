@@ -336,7 +336,7 @@ class StreamTests(unittest.TestCase):
         self.assertEqual(stream.preview()['SCREEN_FRAME']['bytes'], 1)
         self.assertNotIn(frame.data, stream.preview().values())
 
-    def test_first_frame_and_latest_frame_share_the_classification_schedule(self):
+    def test_available_frame_replaces_pending_text_without_waiting_for_text_cadence(self):
         stream = ContextStream()
         stream.start('sprint', {})
         stream.observe(facts(), None, 'window', 20, 2, waiting_for_frame=True)
@@ -345,10 +345,12 @@ class StreamTests(unittest.TestCase):
         stream.observe(facts(), first, 'window', 20.1, 2)
         self.assertIn('ACTIVITY_DURATION', stream.pending)
         stream.pending.clear()
-        stream.observe(facts(), Frame(b'replaced', b'b', 1, 1, 21), 'window', 21, 2)
+        stream.observe(facts(), first, 'window', 21, 2, waiting_for_frame=True)
         self.assertNotIn('ACTIVITY_DURATION', stream.pending)
-        newest = Frame(b'latest', b'c', 1, 1, 22.2)
-        stream.observe(facts(), newest, 'window', 22.2, 2)
+        stream.observe(facts(), Frame(b'replaced', b'b', 1, 1, 21.2), 'window', 21.2, 2)
+        self.assertIn('ACTIVITY_DURATION', stream.pending)
+        newest = Frame(b'latest', b'c', 1, 1, 21.5)
+        stream.observe(facts(), newest, 'window', 21.5, 2)
         self.assertIs(stream.pending['SCREEN_FRAME'].data, newest)
         self.assertEqual(next(reversed(stream.pending)), 'ACTIVITY_DURATION')
 
