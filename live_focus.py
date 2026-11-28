@@ -24,7 +24,8 @@ class LiveFocus:
         profiler = getattr(owner, 'profiler', None)
         self.session = LiveSession({**DEFAULTS, **config}, self.output, self.audio.cancel,
                                    transport_factory or (lambda: GeminiLiveTransport(config, profiler=profiler)),
-                                   observation_current=self.current, profiler=profiler)
+                                   observation_current=self.current, profiler=profiler,
+                                   refresh_visual=self.refresh_visual)
         self.gate = CommentaryGate(config, number(config, 'focus_cooldown_seconds', 45, 15, 300))
         self.allow_images = config.get('activity_send_remote_images') is True
         self.focus_audio = config.get('focus_audio', True)
@@ -63,6 +64,12 @@ class LiveFocus:
                 and stamp == self.session.stream.stamp and signature == self.owner.signature
                 and signature == self.session.stream.window_key
                 and acq.foreground_is_current())
+
+    async def refresh_visual(self, stamp):
+        if not self.allow_images or not self.current(stamp):
+            return None
+        frame = await self.owner.acquisition.capture_for_refresh()
+        return frame if self.current(stamp) else None
 
     def sound_allowed(self):
         return (self.sound_enabled() and self.focus_audio and self.audio.volume > 0

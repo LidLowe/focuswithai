@@ -11,6 +11,9 @@ from activity_context import (BROWSERS, CAPTURE_LIMITS, ContextAggregator, Priva
 from performance import CAPTURE_REASONS, FrameTrace, clock
 
 
+REFRESH_CAPTURE_TIMEOUT = 1.5
+
+
 def background(function, *args, **kwargs):
     """A potentially stalled window provider cannot hold up the event loop or exit."""
     loop = asyncio.get_running_loop()
@@ -54,6 +57,7 @@ class Acquisition:
             self.settings_error = str(error)
         self.media = windows.MediaMonitor() if windows and config.get('media_context_enabled') is True else None
         self.capture_job = self.media_job = self.apps_job = None
+        self.refresh_frame = None
         self.next_capture = self.next_media = self.next_apps = 0
         self.capture_not_before = 0.0
         self.capture_epoch = 0
@@ -90,7 +94,26 @@ class Acquisition:
         self.capture_skip = 'disabled'
         self.reset_frame()
 
+    async def capture_for_refresh(self):
+        window = self.context.window
+        if (not self.active or not self.capture_sprint or not self.privacy.capture_allowed(window)
+                or not self.foreground_is_current()):
+            return None
+        self.capture_backoff = 1
+        self.next_capture = min(self.next_capture, self.capture_not_before)
+        if self.capture_not_before - time.monotonic() >= REFRESH_CAPTURE_TIMEOUT:
+            return None
+        waiter = self.refresh_frame = asyncio.get_running_loop().create_future()
+        try:
+            return await asyncio.wait_for(waiter, REFRESH_CAPTURE_TIMEOUT)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            self.refresh_frame = None
+
     def reset_frame(self):
+        if self.refresh_frame is not None and not self.refresh_frame.done():
+            self.refresh_frame.set_result(None)
         self.capture_epoch += 1
         self.next_capture = 0
         self.capture_backoff = 1
@@ -190,6 +213,8 @@ class Acquisition:
                         recording.tally('frames_dropped', scope=scope)
                         recording.tally('frame_rejected_after_capture', scope=scope)
             if self.job_epoch == self.capture_epoch:
+                if self.refresh_frame is not None and not self.refresh_frame.done():
+                    self.refresh_frame.set_result(frame if not idle else None)
                 self.capture_skip = 'capture_failed' if error else reason
                 self.context.frame_checked_at = frame.captured_at if frame else None
                 if frame:

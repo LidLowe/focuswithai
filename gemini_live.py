@@ -164,6 +164,18 @@ class GeminiLiveTransport(LiveTransport):
             raise LiveSetupError(f'Контексту нужно примерно {minimum} токенов. '
                                  'Увеличь целевой размер контекста и порог сжатия в Gemini Live.')
 
+    def needs_context_refresh(self):
+        return self.sprint_context is not None and (
+            self.refresh_context or self.turns_since_sprint >= 16
+            or self.turns_since_sprint >= 3 and self.prompt_tokens is not None
+            and self.prompt_tokens >= self.trigger_tokens - 3500)
+
+    def fresh_for_refresh(self, frame):
+        return frame is not None and 0 <= time.monotonic() - frame.captured_at <= self.refresh_frame_age
+
+    def needs_visual_refresh(self, pending_frame):
+        return self.allow_images and self.needs_context_refresh() and not self.fresh_for_refresh(pending_frame)
+
     async def wait_ready(self):
         await self.ready.wait()
 
@@ -194,10 +206,7 @@ class GeminiLiveTransport(LiveTransport):
         self.comment = None
         self.turn_prompt_tokens = None
         changes, self.changes = self.changes, {}
-        refresh = self.sprint_context is not None and (
-            self.refresh_context or self.turns_since_sprint >= 16
-            or self.turns_since_sprint >= 3 and self.prompt_tokens is not None
-            and self.prompt_tokens >= self.trigger_tokens - 3500)
+        refresh = self.needs_context_refresh()
         changed_sprint = self.sprint_context != self.sent_sprint
         context = dict(self.context_values if refresh else {}, **changes, ACTIVITY_DURATION=event.data)
         self.requested = context.pop('COMMENTARY_REQUEST', None)
@@ -205,18 +214,15 @@ class GeminiLiveTransport(LiveTransport):
         if refresh or changed_sprint:
             context[self.sprint_kind] = self.sprint_context
         frame, self.frame = self.frame, None
-        # A refresh can reuse the current observation only within one capture interval.
-        # Verification of unchanged pixels does not make an old JPEG a new capture.
-        current = event.current_frame
-        refreshed_image = (refresh and frame is None and self.allow_images and current is not None
-                           and 0 <= time.monotonic() - current.captured_at <= self.refresh_frame_age)
-        if refreshed_image:
-            frame = current
-        if refresh:
-            self.current_image_available = frame is not None
         recording = self.profiler.active if self.profiler else None
+        if refresh:
+            if frame is not None and not self.fresh_for_refresh(frame):
+                if recording:
+                    self._frame_dropped(recording, frame, 'frame_expired_at_context_refresh')
+                frame = self.profile_frame = None
+            self.current_image_available = frame is not None
         queued = self.profile_frame
-        profiled_frame = getattr(frame, 'profile', None) if refreshed_image or queued and queued.stamp == event.stamp else None
+        profiled_frame = getattr(frame, 'profile', None) if queued and queued.stamp == event.stamp else None
         self.profile_turn = trace = TurnTrace(recording, event, profiled_frame) if recording else None
         if trace and frame is not None:
             recording.latency('frame_age_at_send', trace.captured, clock(), trace.scope)
@@ -261,8 +267,6 @@ class GeminiLiveTransport(LiveTransport):
             recording.tally('context_refreshes', scope=trace.scope)
         if trace and frame is not None:
             recording.tally('frames_sent', scope=trace.scope)
-            if refreshed_image:
-                recording.tally('current_frames_refreshed', scope=trace.scope)
             recording.tally('jpeg_sent_bytes', len(frame.data), trace.scope)
         LOG.debug('Gemini Live context sent: %s', ', '.join(context))
         if frame is not None:

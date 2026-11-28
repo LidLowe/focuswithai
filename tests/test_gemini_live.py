@@ -56,7 +56,9 @@ class GeminiTransportTests(unittest.IsolatedAsyncioTestCase):
         await transport.send(stream.event('RECENT_ACTIVITY', {'recent_classifications': ['ON_TASK']}))
 
         async def send_turn(frame=None):
-            await transport.send(replace(stream.event('ACTIVITY_DURATION', 3), current_frame=frame))
+            if frame is not None:
+                await transport.send(stream.event('SCREEN_FRAME', frame))
+            await transport.send(stream.event('ACTIVITY_DURATION', 3))
             transport.ready.set()
             return transport._send_json.call_args.args[0]['clientContent']['turns'][0]['parts']
 

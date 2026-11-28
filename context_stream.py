@@ -22,7 +22,6 @@ class ContextEvent:
     sequence: int
     queued_ns: int | None = None
     recording_id: str | None = None
-    current_frame: object = None
 
 
 class ContextStream:

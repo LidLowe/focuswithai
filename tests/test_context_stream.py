@@ -1,3 +1,4 @@
+import asyncio
 import io
 import sys
 import tempfile
@@ -71,6 +72,37 @@ class AcquisitionTests(unittest.IsolatedAsyncioTestCase):
         source.stop_capture()
         source.sample(now + 4, ide)
         self.assertIsNone(source.capture_job)
+
+    async def test_refresh_uses_new_duplicate_and_keeps_minimum_capture_interval(self):
+        window = Foreground(4, 5, 'Synthetic exercise', r'C:\Editor\editor.exe')
+        now = time.monotonic()
+        previous = Frame(b'old bytes', b'unchanged', 80, 80, now - 3)
+        new = Frame(b'fresh bytes', b'unchanged', 80, 80, now)
+        windows = Mock()
+        windows.foreground.return_value = window
+        windows.user_apps.return_value = []
+        windows.capture_window.return_value = new, None
+        source = Acquisition({'capture_interval': 1}, windows)
+        source.has_capture = True
+        source.start_capture('sprint')
+        source.context.sample(now, window)
+        source.active = True
+        source.context.frame = previous
+        source.capture_backoff = 4
+        source.next_capture = now + 4
+        source.capture_not_before = now + .4
+        refresh = asyncio.create_task(source.capture_for_refresh())
+        await asyncio.sleep(0)
+        self.assertEqual(source.capture_backoff, 1)
+        source.sample(now + .3, window)
+        self.assertIsNone(source.capture_job)
+        source.sample(now + .4, window)
+        await source.capture_job
+        source.sample(now + .5, window)
+        self.assertIs(await refresh, new)
+        self.assertIs(source.context.frame, previous)
+        windows.capture_window.assert_called_once()
+        source.suspend()
 
     async def test_unchanged_frame_stays_valid_and_slows_captures(self):
         chrome = Foreground(4, 5, 'Synthetic exercise - Google Chrome', r'C:\Chrome\chrome.exe')

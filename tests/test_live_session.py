@@ -159,8 +159,42 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         transport.ready.set()
         await until(lambda: len(transport.turns) == 2)
         self.assertEqual(transport.images, [first, newest])
-        self.assertIs(transport.turns[-1].current_frame, newest)
+        self.assertEqual(transport.turns[-1].stamp, session.stream.stamp)
         self.assertEqual(cancel_audio.call_count, cancellations)
+
+    async def test_refresh_wait_discards_image_for_previous_window(self):
+        requested, release = asyncio.Event(), asyncio.Event()
+        old = Frame(b'old refresh JPEG', b'a', 1, 1, 20)
+        new = Frame(b'new window JPEG', b'b', 1, 1, 21)
+
+        class Refresh(Trace):
+            def __init__(self):
+                super().__init__()
+                self.frames = []
+
+            def needs_visual_refresh(self, frame):
+                return frame is None
+
+            async def send(self, event):
+                if event.kind == 'SCREEN_FRAME':
+                    self.frames.append(event.data)
+                await super().send(event)
+
+        async def fresh(_stamp):
+            requested.set()
+            await release.wait()
+            return old
+
+        transport = Refresh()
+        session = LiveSession({}, Mock(), Mock(), lambda: transport, refresh_visual=fresh)
+        self.addAsyncCleanup(session.close)
+        session.start('test', facts()['sprint'])
+        session.observe(facts(), None, 'old', 20)
+        await asyncio.wait_for(requested.wait(), 1)
+        session.observe(facts('new window'), new, 'new', 21)
+        release.set()
+        await until(lambda: session.result is not None)
+        self.assertEqual(transport.frames, [new])
 
     async def test_correction_interrupts_and_clears_accepted_response(self):
         session = LiveSession({}, Mock(), Mock(), MockLiveTransport)

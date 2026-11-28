@@ -6,7 +6,7 @@ import math
 import logging
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from activity_protocol import PROTOCOL_PROMPT, SYSTEM_PROMPT, Result
 from commentary import INSTRUCTION, KINDS
@@ -74,10 +74,11 @@ class LiveTransport(ABC):
 
 
 class LiveSession:
-    def __init__(self, config, on_output, cancel_audio, factory, *, observation_current=None, profiler=None):
+    def __init__(self, config, on_output, cancel_audio, factory, *, observation_current=None, profiler=None, refresh_visual=None):
         self.profiler = profiler
         self.stream = ContextStream(profiler)
         self.factory = factory
+        self.refresh_visual = refresh_visual
         self.observation_current = observation_current
         self.model = config.get('gemini_live_model') or 'Gemini Live'
         self.on_output, self.cancel_audio = on_output, cancel_audio
@@ -213,11 +214,30 @@ class LiveSession:
                 self._profile_timeout('previous_turn_timeout')
                 raise LiveProtocolError('Gemini не завершил предыдущий ход до истечения тайм-аута.') from None
             wait_finished = clock() if recording else None
+            if self.refresh_visual and not (self.block_reason or self.interrupted):
+                await self._refresh_frame(transport)
             await self._send_with_timeout(self._dispatch_turn(
                 transport, generation, recording, wait_started if waiting_for_turn else None, wait_finished,
             ), 'передача наблюдения')
             if 'ACTIVITY_DURATION' in self.stream.pending:
                 wake.set()
+
+    async def _refresh_frame(self, transport):
+        needs_frame = getattr(transport, 'needs_visual_refresh', None)
+        pending = self.stream.pending.get('SCREEN_FRAME')
+        if not needs_frame or not needs_frame(pending.data if pending else None):
+            return
+        stamp = self.stream.stamp
+        frame = await self.refresh_visual(stamp)
+        if (frame is None or stamp != self.stream.stamp or self.interrupted or self.block_reason
+                or 'ACTIVITY_DURATION' not in self.stream.pending):
+            return
+        pending = self.stream.pending.get('SCREEN_FRAME')
+        if pending and pending.data and pending.data.captured_at >= frame.captured_at:
+            return
+        # A fresh capture of identical pixels is sent only for this refresh.
+        self.stream.put('SCREEN_FRAME', frame, remember=False)
+        self.stream.pending.move_to_end('ACTIVITY_DURATION')
 
     async def _dispatch_turn(self, transport, generation, recording, waited_from, ready_at):
         # Take the observation after wait_ready, in the same task that sends it.
@@ -229,7 +249,6 @@ class LiveSession:
             if kind == 'COMMENTARY_REQUEST':
                 self.queued_request = event.data
             elif kind == 'ACTIVITY_DURATION':
-                event = replace(event, current_frame=self.stream.latest.get('SCREEN_FRAME'))
                 self.stream.last_duration = self.stream.last_seen
                 self.requested, self.queued_request = self.queued_request, None
                 self.turn = event.sequence
