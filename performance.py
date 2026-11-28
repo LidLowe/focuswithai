@@ -27,6 +27,9 @@ EXPORT_LIMIT = 12000
 EDGES = (0, *sorted({round(1.05 ** i) for i in range(610)}))
 METRICS = {
     'foreground': 'Получение активного окна',
+    'turn_ready': 'От отправки до готовности к следующему ходу',
+    'frame_age_at_send': 'Возраст кадра при подготовке отправки',
+    'classification_interval': 'Интервал принятых классификаций',
     'screenshot': 'Захват окна Windows',
     'browser_verification': 'Проверка браузера',
     'resize': 'Масштабирование',
@@ -55,6 +58,7 @@ CONFIG_DEFAULTS = {
     'live_analysis_seconds': 8, 'activity_send_remote_images': False, 'live_proactive': False,
     'audio_frequency': 48000, 'audio_buffer': 2048, 'alarm_voice_delay_ms': 300,
     'focus_audio': True, 'live_volume': .55,
+    'gemini_live_trigger_tokens': 16384, 'gemini_live_target_tokens': 8192,
 }
 CAPTURE_REASONS = frozenset({
     'blank_frame', 'foreground_changed', 'protected_window', 'invalid_dimensions', 'capture_failed',
@@ -155,6 +159,7 @@ class Recording:
         self.active_sprint = None
         self.sprint_started = self.started
         self.buckets = {}
+        self.prompt_history = {}
         self.last_frame = self.resources = self.last_usage = None
         self.frame_ids = count(1)
         self.dropped = 0
@@ -231,6 +236,8 @@ class Recording:
         if self.active_sprint and scope and self.active_sprint == scope['sprint_id']:
             self.sprint.add(kind, name, value)
         index = at // (BUCKET_SECONDS * SECOND)
+        if kind == 'usage' and 'promptTokenCount' in value:
+            self.prompt_history[index] = value['promptTokenCount']
         if index not in self.buckets:
             self.buckets[index] = (Totals(), None)
         self.buckets[index][0].add(kind, name, value)
@@ -282,6 +289,7 @@ class Recording:
         for key in tuple(self.buckets):
             if key < floor:
                 del self.buckets[key]
+                self.prompt_history.pop(key, None)
 
     def _snapshot(self, now):
         duration = max(0, now - self.started) / SECOND
@@ -305,7 +313,7 @@ class Recording:
                             'frames': totals.counters['frames_sent'],
                             'captured': totals.counters['frames_captured'],
                             'out_bytes': totals.counters['ws_out_bytes'], 'in_bytes': totals.counters['ws_in_bytes'],
-                            'resources': resource})
+                            'resources': resource, 'prompt_tokens': self.prompt_history.get(key)})
         return {'recording_id': self.id, 'started_at': self.wall / SECOND, 'running': self.running,
                 'duration_seconds': duration, 'model': self.model, 'config': self.config, 'sprint_id': self.active_sprint,
                 'windows': window_stats, 'history': history, 'history_bucket_seconds': BUCKET_SECONDS,

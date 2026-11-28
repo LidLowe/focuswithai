@@ -26,12 +26,30 @@ MODELS = {
     'gemini-3.8-live': 'Gemini 3.8 Live',
     'gemini-3.8-live-extended-thinking': 'Gemini 3.8 Live Extended Thinking',
 }
+COMPRESSION_MIN = 4096
+COMPRESSION_MAX = 126976  # Leave room in the 131072-token model window for the next turn.
 VOICES = {'Charon': 'Charon', 'Orus': 'Orus', 'Kore': 'Kore', 'Puck': 'Puck', 'Fenrir': 'Fenrir'}
 DEFAULTS = {'gemini_live_model': next(iter(MODELS)), 'gemini_live_voice': 'Charon',
-            'gemini_live_prompt': '', 'google_assistant_api_key': ''}
+            'gemini_live_prompt': '', 'google_assistant_api_key': '',
+            'gemini_live_trigger_tokens': 16384, 'gemini_live_target_tokens': 8192}
+
+
+def compression_options(config):
+    trigger = config.get('gemini_live_trigger_tokens', DEFAULTS['gemini_live_trigger_tokens'])
+    target = config.get('gemini_live_target_tokens', DEFAULTS['gemini_live_target_tokens'])
+    if (type(trigger) is not int or type(target) is not int
+            or not COMPRESSION_MIN <= target < trigger <= COMPRESSION_MAX):
+        raise LiveSetupError(f'Лимиты контекста: {COMPRESSION_MIN} ≤ размер после сжатия < порог ≤ {COMPRESSION_MAX}.')
+    return trigger, target
+
+
+def context_tokens(text):
+    # Local estimate only. The image and request overhead have a separate allowance.
+    return (len(text.encode('utf-8')) + 2) // 3
 
 
 def validate_preferences(config):
+    compression_options(config)
     model = config.get('gemini_live_model', DEFAULTS['gemini_live_model'])
     if not isinstance(model, str) or model not in MODELS:
         raise LiveSetupError('Выбери поддерживаемую модель Gemini Live.')
@@ -91,8 +109,18 @@ class GeminiLiveTransport(LiveTransport):
         self.outputs = deque()
         self.native_audio_bytes = 0
         self.changes = {}
+        self.trigger_tokens, self.target_tokens = compression_options(config)
+        self.sprint_context = self.sent_sprint = None
+        self.sprint_kind = "SPRINT_STARTED"
+        self.context_values = {}
+        self.prompt_tokens = self.turn_prompt_tokens = None
+        self.turns_since_sprint = 0
+        self.refresh_context = False
+        self.instruction_budget = self.sprint_budget = 0
 
     async def connect(self, instructions):
+        self.instruction_budget = context_tokens(instructions + REPORT_INSTRUCTIONS)
+        self.check_budget(0)
         self.session = aiohttp.ClientSession(trust_env=False)
         # Keep credentials out of the WebSocket URL and diagnostics.
         try:
@@ -110,7 +138,8 @@ class GeminiLiveTransport(LiveTransport):
                 'speechConfig': {'voiceConfig': {'prebuiltVoiceConfig': {'voiceName': self.voice}}},
             },
             'systemInstruction': {'parts': [{'text': f'{instructions}\n\n{REPORT_INSTRUCTIONS}'}]},
-            'contextWindowCompression': {'slidingWindow': {}},
+            'contextWindowCompression': {'triggerTokens': self.trigger_tokens,
+                                         'slidingWindow': {'targetTokens': self.target_tokens}},
             'tools': [{'functionDeclarations': [{
                 'name': REPORT,
                 'description': 'Submit an advisory classification and optional voice proposal.',
@@ -123,6 +152,15 @@ class GeminiLiveTransport(LiveTransport):
         self.setup_complete = True
         LOG.info('Gemini Live setupComplete received (model=%s)', self.model)
 
+    def check_budget(self, observation_budget):
+        # Reserve space for the tool envelope and an FHD frame independently of JPEG byte size.
+        minimum = self.instruction_budget + self.sprint_budget + observation_budget + 1152
+        if self.allow_images:
+            minimum += 3072
+        if minimum > self.target_tokens:
+            raise LiveSetupError(f'Контексту нужно примерно {minimum} токенов. '
+                                 'Увеличь целевой размер контекста и порог сжатия в Gemini Live.')
+
     async def wait_ready(self):
         await self.ready.wait()
 
@@ -133,7 +171,15 @@ class GeminiLiveTransport(LiveTransport):
             self.profile_frame = event if self.frame is not None and event.queued_ns is not None else None
             return
         if event.kind != 'ACTIVITY_DURATION':
-            self.changes[event.kind] = event.data
+            if event.kind in ('SPRINT_STARTED', 'SPRINT_UPDATED'):
+                self.sprint_kind = event.kind
+                if self.sprint_context != event.data:
+                    self.sprint_context = event.data
+                    self.sprint_budget = context_tokens(json.dumps(event.data, ensure_ascii=False))
+            else:
+                self.changes[event.kind] = event.data
+                if event.kind != 'COMMENTARY_REQUEST' and event.kind != 'USER_CORRECTION':
+                    self.context_values[event.kind] = event.data
             return
 
         # Only one server turn at a time. The server does not echo our observation ID.
@@ -143,14 +189,28 @@ class GeminiLiveTransport(LiveTransport):
         self.active = event
         self.stale = self.reported = False
         self.comment = None
+        self.turn_prompt_tokens = None
         changes, self.changes = self.changes, {}
-        context = dict(changes, ACTIVITY_DURATION=event.data)
+        refresh = self.sprint_context is not None and (
+            self.refresh_context or self.turns_since_sprint >= 16
+            or self.turns_since_sprint >= 3 and self.prompt_tokens is not None
+            and self.prompt_tokens >= self.trigger_tokens - 3500)
+        changed_sprint = self.sprint_context != self.sent_sprint
+        context = dict(self.context_values if refresh else {}, **changes, ACTIVITY_DURATION=event.data)
         self.requested = context.pop('COMMENTARY_REQUEST', None)
+        self.check_budget(context_tokens(json.dumps(self.context_values, ensure_ascii=False)))
+        if refresh or changed_sprint:
+            context[self.sprint_kind] = self.sprint_context
         frame, self.frame = self.frame, None
+        if refresh and frame is None:
+            # The server can have discarded its prior image. Preserve only fresh pixels from the queue.
+            self.current_image_available = False
         recording = self.profiler.active if self.profiler else None
         queued = self.profile_frame
         profiled_frame = getattr(frame, 'profile', None) if queued and queued.stamp == event.stamp else None
         self.profile_turn = trace = TurnTrace(recording, event, profiled_frame) if recording else None
+        if trace and frame is not None:
+            recording.latency('frame_age_at_send', trace.captured, clock(), trace.scope)
         if trace and queued and queued.stamp == event.stamp and queued.recording_id == recording.id:
             recording.latency('frame_queue', queued.queued_ns, clock(), trace.scope)
             if profiled_frame and profiled_frame.recording_id == recording.id and 'jpeg' in profiled_frame.timings:
@@ -182,6 +242,14 @@ class GeminiLiveTransport(LiveTransport):
                 recording.tally('frames_dropped', scope=trace.scope)
                 recording.tally('frame_send_incomplete', scope=trace.scope)
             raise
+        if refresh or changed_sprint:
+            self.sent_sprint = self.sprint_context
+            self.turns_since_sprint = 0
+            self.refresh_context = False
+        else:
+            self.turns_since_sprint += 1
+        if refresh and recording:
+            recording.tally('context_refreshes', scope=trace.scope)
         if trace and frame is not None:
             recording.tally('frames_sent', scope=trace.scope)
             recording.tally('jpeg_sent_bytes', len(frame.data), trace.scope)
@@ -237,6 +305,7 @@ class GeminiLiveTransport(LiveTransport):
         self.current_image_available = False
         self.frame = None
         self.changes.clear()
+        self.context_values.clear()
         self.outputs.clear()
         if self.active:
             # Discard the old turn until its terminal event, so late audio cannot
@@ -257,7 +326,11 @@ class GeminiLiveTransport(LiveTransport):
                 await self._report(message['toolCall'].get('functionCalls', []))
             if 'serverContent' in message:
                 self._content(message['serverContent'])
-            usage = message.get('usageMetadata', {}).get('totalTokenCount')
+            metadata = message.get('usageMetadata', {})
+            prompt_tokens = metadata.get('promptTokenCount')
+            if type(prompt_tokens) is int and prompt_tokens >= 0:
+                self.turn_prompt_tokens = prompt_tokens
+            usage = metadata.get('totalTokenCount')
             if self.active and not self.stale and type(usage) is int:
                 self._emit('USAGE', usage)
             content = message.get('serverContent', {})
@@ -267,7 +340,15 @@ class GeminiLiveTransport(LiveTransport):
             if idle or (not self.extended and content.get('turnComplete') and content.get('interactionStatus') != 'IN_PROGRESS'):
                 if not self.stale:
                     self._emit('END')
+                if self.turn_prompt_tokens is not None:
+                    before = self.prompt_tokens
+                    self.prompt_tokens = self.turn_prompt_tokens
+                    if before is not None and before - self.prompt_tokens >= max(512, before // 10):
+                        self.refresh_context = True
+                        if self.profile_turn:
+                            self.profile_turn.recording.tally('context_size_reductions', scope=self.profile_turn.scope)
                 if self.profile_turn:
+                    self.profile_turn.mark('turn_ready', clock())
                     self.profile_turn.finish(final=True)
                 self.active = self.comment = None
                 self.ready.set()

@@ -9,7 +9,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -41,6 +41,49 @@ class GeminiTransportTests(unittest.IsolatedAsyncioTestCase):
             GeminiLiveTransport(config)
         config['google_assistant_api_key'] = 'example'
         self.assertFalse(GeminiLiveTransport(config).allow_images)
+
+    async def test_context_refresh_restores_current_sprint_and_latest_observations(self):
+        config = {'activity_allow_remote': True, 'google_assistant_api_key': 'fixture',
+                  'activity_send_remote_images': True}
+        transport = GeminiLiveTransport(config)
+        transport._send_json = AsyncMock()
+        stream = ContextStream()
+        sprint = {'goal': 'Read the circuit notes', 'context': 'Keep the entire sprint instruction'}
+        stream.start('fixture', sprint)
+        await transport.send(stream.event('SPRINT_STARTED', sprint))
+        await transport.send(stream.event('FOREGROUND_CHANGED', ('notes.exe', 'Circuit notes')))
+        await transport.send(stream.event('RECENT_ACTIVITY', {'recent_classifications': ['ON_TASK']}))
+
+        async def send_turn():
+            await transport.send(stream.event('ACTIVITY_DURATION', 3))
+            transport.ready.set()
+            return transport._send_json.call_args.args[0]['clientContent']['turns'][0]['parts']
+
+        first = json.loads((await send_turn())[0]['text'])
+        self.assertEqual(first['context_updates']['SPRINT_STARTED'], sprint)
+        await transport.send(stream.event('SPRINT_STARTED', sprint))
+        second = json.loads((await send_turn())[0]['text'])
+        self.assertNotIn('SPRINT_STARTED', second['context_updates'])
+        transport.refresh_context = True
+        transport.current_image_available = True
+        refreshed = await send_turn()
+        updates = json.loads(refreshed[0]['text'])
+        self.assertEqual(updates['context_updates']['SPRINT_STARTED'], sprint)
+        self.assertEqual(updates['context_updates']['FOREGROUND_CHANGED'], ['notes.exe', 'Circuit notes'])
+        self.assertEqual(updates['context_updates']['RECENT_ACTIVITY'], {'recent_classifications': ['ON_TASK']})
+        self.assertFalse(updates['current_image_available'])
+        self.assertEqual(len(refreshed), 1)
+
+    def test_context_budget_checks_order_type_and_preserves_large_instructions(self):
+        config = {'activity_allow_remote': True, 'google_assistant_api_key': 'fixture'}
+        for trigger, target in [(8192, 8192), (16384, True), (131072, 8192)]:
+            with self.subTest(trigger=trigger, target=target), self.assertRaises(LiveSetupError):
+                GeminiLiveTransport(dict(config, gemini_live_trigger_tokens=trigger,
+                                         gemini_live_target_tokens=target))
+        transport = GeminiLiveTransport(config)
+        transport.instruction_budget = 8000
+        with self.assertRaisesRegex(LiveSetupError, '9152'):
+            transport.check_budget(0)
 
     async def test_probe_uses_only_setup_and_masks_google_error(self):
         messages = []
@@ -562,7 +605,8 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
         preferences = 'Classify by the sprint evidence.\n' + 'Ж' * 8000 + ' CRITERIA_TAIL'
         style = 'Use plain language.\n' + 'a' * 8000 + ' VOICE_TAIL'
         config = {'activity_allow_remote': True, 'google_assistant_api_key': 'fixture',
-                  'activity_classification_prompt': preferences, 'gemini_live_prompt': style}
+                  'activity_classification_prompt': preferences, 'gemini_live_prompt': style,
+                  'gemini_live_trigger_tokens': 65536, 'gemini_live_target_tokens': 49152}
         received = {}
         completed = asyncio.Event()
 
@@ -774,6 +818,7 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(len(value) == 8192 for value in (*sprint.values(), preferences)))
         result = await self.classify_synthetic_window(
             {**self.real_config(), 'activity_classification_prompt': preferences,
+             'gemini_live_trigger_tokens': 65536, 'gemini_live_target_tokens': 49152,
              'gemini_live_prompt': 'Spoken commentary should use a calm tone and omit numbers.'},
             sprint, ('Local QA — calibration registry', [
                 'Ticket: calibrate the current activity review',

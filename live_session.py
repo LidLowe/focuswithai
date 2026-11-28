@@ -105,6 +105,7 @@ class LiveSession:
         self.error = self.connected = self.tokens = self.latency = None
         self.last_success = self.last_model_response = None
         self.classifications = 0
+        self.profile_previous_classification = None
         self.reset_output()
 
     def reset_output(self):
@@ -322,7 +323,13 @@ class LiveSession:
                     continue
                 self.result = Result.parse(msg.data)
                 if msg.profile:
-                    msg.profile.assessment('classifications_ok', at=clock())
+                    accepted = clock()
+                    msg.profile.assessment('classifications_ok', at=accepted)
+                    previous = self.profile_previous_classification
+                    key = (msg.profile.recording.id, msg.stamp.generation)
+                    if previous and previous[0] == key:
+                        msg.profile.recording.latency('classification_interval', previous[1], accepted, msg.profile.scope)
+                    self.profile_previous_classification = key, accepted
                 self.previous_label, self.label = self.label, self.result.classification
                 self.assessed_turn = msg.turn
                 self.assessment_due = None

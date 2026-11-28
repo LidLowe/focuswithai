@@ -101,6 +101,7 @@ const live = () => !!(S.status && S.status.live);
 function loadCfg(r) {
   S.cfg = r.config; S.defaults = r.defaults; S.models = r.models; S.voices = r.voices; S.mtime = r.mtime;
   S.captureLimits = r.capture_limits || {};
+  S.compressionLimits = r.compression_limits;
   S.sprintTextLimits = r.sprint_text_limits || {};
   S.promptLimits = r.prompt_limits || {};
   S.draft = clone(r.config); S.touched.clear();
@@ -792,6 +793,7 @@ const PERF_COUNTERS = {
   classifications_stale: 'Устаревшие оценки', reconnects: 'Переподключения', timeouts: 'Тайм-ауты',
   ws_in_bytes: 'Входящие байты WS', ws_out_bytes: 'Исходящие байты WS', base64_bytes: 'Байты Base64',
   jpeg_sent_bytes: 'Байты отправленных JPEG', serialized_turn_bytes: 'Байты JSON ходов',
+  context_refreshes: 'Обновления контекста', context_size_reductions: 'Наблюдаемые уменьшения контекста',
 };
 const PERF_TOKENS = {
   promptTokenCount: 'Промпт', responseTokenCount: 'Ответ', totalTokenCount: 'Всего по API',
@@ -855,6 +857,7 @@ function performanceView() {
     <section class="card pad">
       <h2>История · до 15 мин · шаг ${data.history_bucket_seconds} с</h2>
       <div class="performance-charts">
+        <div><h3>Размер контекста · promptTokenCount</h3><canvas data-perf-chart="context" aria-label="Размер контекста по ходам" role="img"></canvas></div>
         <div><h3>Задержка · P50, мс</h3><canvas data-perf-chart="latency" aria-label="История задержек" role="img"></canvas></div>
         <div><h3>Кадры в секунду</h3><canvas data-perf-chart="frames" aria-label="Пропускная способность кадров" role="img"></canvas></div>
         <div><h3>WebSocket · КиБ/с</h3><canvas data-perf-chart="network" aria-label="Пропускная способность WebSocket" role="img"></canvas></div>
@@ -866,6 +869,9 @@ function performanceView() {
         ['Входящий трафик', rates('ws_in_bytes', true)], ['Исходящий трафик', rates('ws_out_bytes', true)],
         ...Object.entries(PERF_COUNTERS).map(([key,label]) => [label, perfNum(frames[key] || 0, 0)])])}
       ${advanced.length ? `<details><summary>Категории событий</summary>${perfGrid(advanced.map(([name, value]) => [name, perfNum(value, 0)]))}</details>` : ''}
+      ${perfGrid([['Текущий promptTokenCount', perfNum(latest.fields?.promptTokenCount, 0)],
+        ['Порог / цель сжатия', perfNum(data.config.gemini_live_trigger_tokens, 0) + ' / ' + perfNum(data.config.gemini_live_target_tokens, 0)]])}
+      <p class="note">Уменьшение promptTokenCount — наблюдение по метаданным. Отдельного подтверждения сжатия здесь нет.</p>
       <h3>Токены Gemini по завершённым ходам · ${perfNum(frames.token_turns || 0, 0)}</h3>
       ${perfGrid(Object.entries(PERF_TOKENS).map(([key, label]) => [label, perfNum(frames[key], 0)]))}
       ${latest.fields ? `<p class="note">Последние данные API · ход ${esc(latest.turn_id)} · ${latest.final ? 'завершён' : 'частичный'}
@@ -879,6 +885,7 @@ const PERF_CHARTS = {
             ['Ответ Gemini', '#b94723', h => h.latency_ms.classification],
             ['Предыдущий ход', '#7650a2', h => h.latency_ms.previous_turn],
             ['PCM → микшер', '#267c57', h => h.latency_ms.audio_local]],
+  context: [['Сообщено Gemini', '#214c95', h => h.prompt_tokens]],
   frames: [['Захват', '#214c95', (h, dt) => h.captured / dt],
            ['Отправка', '#267c57', (h, dt) => h.frames / dt]],
   network: [['Исходящие', '#214c95', (h, dt) => h.out_bytes / 1024 / dt],
@@ -1029,6 +1036,8 @@ PAGES.live = {
         ${contextField('Голос', 'gemini_live_voice', Object.entries(S.voices))}
         ${row('API-ключ Gemini', '', 'google_assistant_api_key', txt('google_assistant_api_key', {secret: true, label: 'API-ключ Gemini'}))}
         ${contextFlag('Передавать цель и текстовый контекст активности в Google', 'activity_allow_remote')}
+        ${S.compressionLimits ? contextNumber('Порог сжатия контекста, токены', 'gemini_live_trigger_tokens', S.compressionLimits.min, S.compressionLimits.max)
+          + contextNumber('Размер после сжатия, токены', 'gemini_live_target_tokens', S.compressionLimits.min, S.compressionLimits.max) : ''}
         ${contextNumber('Интервал анализа, с', 'live_analysis_seconds', 2, 120)}
         ${contextNumber('Громкость Live Audio', 'live_volume', 0, 1, .05)}
         ${contextFlag('Инициативные комментарии', 'live_proactive')}

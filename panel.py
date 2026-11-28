@@ -17,7 +17,7 @@ from activity_context import CAPTURE_LIMITS, validate_context_settings
 from activity_protocol import PROMPT_LIMITS, validate_prompts
 from audio_import import save_clip
 from config_store import DEFAULT_PORT, SECRET_KEYS, VERSION, defaults, load_config, public_config, save_config
-from gemini_live import MODELS, VOICES, GeminiLiveTransport, validate_preferences
+from gemini_live import COMPRESSION_MAX, COMPRESSION_MIN, MODELS, VOICES, GeminiLiveTransport, validate_preferences
 from live_session import LiveSession
 from sprints import SPRINT_TEXT_LIMITS
 from startup_manager import StartupTask
@@ -405,6 +405,7 @@ class Panel:
             'config': mask_config(config),
             'defaults': defaults(),
             'capture_limits': CAPTURE_LIMITS,
+            'compression_limits': {'min': COMPRESSION_MIN, 'max': COMPRESSION_MAX},
             'sprint_text_limits': SPRINT_TEXT_LIMITS,
             'prompt_limits': PROMPT_LIMITS,
             'models': MODELS, 'voices': VOICES,
