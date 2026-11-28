@@ -147,7 +147,7 @@ class GeminiLiveTransport(LiveTransport):
                 'name': REPORT,
                 'description': 'Submit an advisory classification and optional voice proposal.',
                 'parametersJsonSchema': REPORT_PARAMETERS,
-                'behavior': 'NON_BLOCKING',
+                'behavior': 'NON_BLOCKING' if self.extended else 'BLOCKING',
             }]}],
         }})
         if 'setupComplete' not in await self._message():
@@ -403,10 +403,7 @@ class GeminiLiveTransport(LiveTransport):
             if speak:
                 reply['commentary_text'] = self.comment['text']
                 reply['instruction'] = 'Say commentary_text aloud now.'
-            response = {'name': name, 'id': call_id, 'response': reply}
-            if not self.extended and name == REPORT:
-                response['scheduling'] = 'WHEN_IDLE' if speak else 'SILENT'
-            responses.append(response)
+            responses.append({'name': name, 'id': call_id, 'response': reply})
         if responses:
             await self._send_json({'toolResponse': {'functionResponses': responses}}, trace=self.profile_turn, reply=True)
 
