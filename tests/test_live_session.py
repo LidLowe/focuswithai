@@ -2,6 +2,7 @@ import asyncio
 import unittest
 from unittest.mock import Mock
 
+from activity_context import Frame
 from live_session import LiveSession, Output
 from mock_live import MockLiveTransport
 from test_context_stream import facts
@@ -119,6 +120,47 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         await until(lambda: session.result and session.result.observed_activity == 'latest')
         self.assertEqual(transport.windows, ['Synthetic editor', 'latest'])
         self.assertEqual(session.reconnects, 0)
+
+    async def test_latest_frame_waits_for_audio_turn_and_is_sent_once(self):
+        class BusyTurn(Trace):
+            def __init__(self):
+                super().__init__()
+                self.ready = asyncio.Event()
+                self.ready.set()
+                self.images = []
+                self.turns = []
+
+            async def wait_ready(self):
+                await self.ready.wait()
+
+            async def send(self, event):
+                if event.kind == 'SCREEN_FRAME':
+                    self.images.append(event.data)
+                if event.kind == 'ACTIVITY_DURATION':
+                    self.turns.append(event)
+                    self.ready.clear()
+                await super().send(event)
+
+        transport = BusyTurn()
+        cancel_audio = Mock()
+        session = LiveSession({'live_analysis_seconds': 2}, Mock(), cancel_audio, lambda: transport)
+        self.addAsyncCleanup(session.close)
+        session.start('test', facts()['sprint'])
+        first = Frame(b'first', b'a', 1, 1, 20)
+        session.observe(facts(), first, 1, 20)
+        await until(lambda: session.result)
+        cancellations = cancel_audio.call_count
+        session.observe(facts(), Frame(b'obsolete', b'b', 1, 1, 22), 1, 22)
+        await asyncio.sleep(.02)
+        newest = Frame(b'newest', b'c', 1, 1, 23)
+        session.observe(facts(), newest, 1, 23)
+        self.assertEqual(transport.images, [first])
+        self.assertEqual(cancel_audio.call_count, cancellations)
+        transport.ready.set()
+        await until(lambda: len(transport.turns) == 2)
+        self.assertEqual(transport.images, [first, newest])
+        self.assertIs(transport.turns[-1].current_frame, newest)
+        self.assertEqual(cancel_audio.call_count, cancellations)
 
     async def test_correction_interrupts_and_clears_accepted_response(self):
         session = LiveSession({}, Mock(), Mock(), MockLiveTransport)

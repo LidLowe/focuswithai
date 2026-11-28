@@ -202,12 +202,16 @@ class GeminiLiveTransport(LiveTransport):
         if refresh or changed_sprint:
             context[self.sprint_kind] = self.sprint_context
         frame, self.frame = self.frame, None
-        if refresh and frame is None:
-            # The server can have discarded its prior image. Preserve only fresh pixels from the queue.
-            self.current_image_available = False
+        # A context refresh can restore the current observation when acquisition
+        # still considers it valid. It never looks up frames from older observations.
+        refreshed_image = refresh and frame is None and self.allow_images and event.current_frame is not None
+        if refreshed_image:
+            frame = event.current_frame
+        if refresh:
+            self.current_image_available = frame is not None
         recording = self.profiler.active if self.profiler else None
         queued = self.profile_frame
-        profiled_frame = getattr(frame, 'profile', None) if queued and queued.stamp == event.stamp else None
+        profiled_frame = getattr(frame, 'profile', None) if refreshed_image or queued and queued.stamp == event.stamp else None
         self.profile_turn = trace = TurnTrace(recording, event, profiled_frame) if recording else None
         if trace and frame is not None:
             recording.latency('frame_age_at_send', trace.captured, clock(), trace.scope)
@@ -252,6 +256,8 @@ class GeminiLiveTransport(LiveTransport):
             recording.tally('context_refreshes', scope=trace.scope)
         if trace and frame is not None:
             recording.tally('frames_sent', scope=trace.scope)
+            if refreshed_image:
+                recording.tally('current_frames_refreshed', scope=trace.scope)
             recording.tally('jpeg_sent_bytes', len(frame.data), trace.scope)
         LOG.debug('Gemini Live context sent: %s', ', '.join(context))
         if frame is not None:

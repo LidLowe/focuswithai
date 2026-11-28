@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -54,8 +55,8 @@ class GeminiTransportTests(unittest.IsolatedAsyncioTestCase):
         await transport.send(stream.event('FOREGROUND_CHANGED', ('notes.exe', 'Circuit notes')))
         await transport.send(stream.event('RECENT_ACTIVITY', {'recent_classifications': ['ON_TASK']}))
 
-        async def send_turn():
-            await transport.send(stream.event('ACTIVITY_DURATION', 3))
+        async def send_turn(frame=None):
+            await transport.send(replace(stream.event('ACTIVITY_DURATION', 3), current_frame=frame))
             transport.ready.set()
             return transport._send_json.call_args.args[0]['clientContent']['turns'][0]['parts']
 
@@ -73,6 +74,12 @@ class GeminiTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updates['context_updates']['RECENT_ACTIVITY'], {'recent_classifications': ['ON_TASK']})
         self.assertFalse(updates['current_image_available'])
         self.assertEqual(len(refreshed), 1)
+
+        transport.refresh_context = True
+        current = Frame(b'current JPEG', b'fingerprint', 1280, 720, time.monotonic())
+        restored = await send_turn(current)
+        self.assertTrue(json.loads(restored[0]['text'])['current_image_available'])
+        self.assertEqual(base64.b64decode(restored[1]['inlineData']['data']), current.data)
 
     def test_context_budget_checks_order_type_and_preserves_large_instructions(self):
         config = {'activity_allow_remote': True, 'google_assistant_api_key': 'fixture'}

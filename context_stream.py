@@ -22,6 +22,7 @@ class ContextEvent:
     sequence: int
     queued_ns: int | None = None
     recording_id: str | None = None
+    current_frame: object = None
 
 
 class ContextStream:
@@ -40,7 +41,8 @@ class ContextStream:
         self.window_key = None
         self.latest = {}
         self.pending = OrderedDict()
-        self.last_duration = None
+        self.last_duration = self.last_seen = None
+        self.visual_seen = False
 
     def start(self, sprint_id, sprint, kind='SPRINT_STARTED'):
         self.clear()
@@ -50,6 +52,7 @@ class ContextStream:
 
     def advance(self):
         stamp = self.stamp
+        self.visual_seen = False
         self.stamp = Stamp(stamp.sprint_id, stamp.generation, stamp.observation + 1)
 
     def block(self):
@@ -84,7 +87,8 @@ class ContextStream:
         self.pending[kind] = self.event(kind, data)
         self.pending.move_to_end(kind)
 
-    def observe(self, facts, frame, window_key, now, interval):
+    def observe(self, facts, frame, window_key, now, interval, *, waiting_for_frame=False):
+        self.last_seen = now
         browser = facts['browser']
         values = {
             'FOREGROUND_CHANGED': (facts['application'], facts['window_title']),
@@ -106,10 +110,15 @@ class ContextStream:
             changed = {k: v for k, v in values.items() if self.latest.get(k) != v}
         for kind, data in changed.items():
             self.put(kind, data)
-        if 'ACTIVITY_DURATION' in self.pending:
+        turn_pending = 'ACTIVITY_DURATION' in self.pending
+        if turn_pending:
             self.pending.move_to_end('ACTIVITY_DURATION')
-        image_changed = 'SCREEN_FRAME' in changed
-        if self.last_duration is None or image_changed or now - self.last_duration >= interval:
+        # Give the first capture a short head start. Metadata alone is still
+        # enough to start a turn when there is no image or capture times out.
+        first_image = frame is not None and not self.visual_seen
+        self.visual_seen |= frame is not None
+        due = self.last_duration is None or first_image or now - self.last_duration >= interval
+        if (turn_pending and changed) or (not turn_pending and due and not waiting_for_frame):
             self.last_duration = now
             self.put('ACTIVITY_DURATION', facts['activity_seconds'])
             self.put('RECENT_ACTIVITY', {

@@ -76,7 +76,12 @@ class LiveFocus:
             {'kind': kind, 'seconds_ago': round(now - at)}
             for at, kind in self.gate.warnings if now - at < 180
         ]
-        session.observe(facts, frame if self.allow_images else None, key, now)
+        acquisition = self.owner.acquisition
+        waiting_for_frame = (self.allow_images and frame is None and acquisition.capture_job is not None
+                             and acquisition.job_epoch == acquisition.capture_epoch
+                             and now - acquisition.context.entered < 1.25)
+        session.observe(facts, frame if self.allow_images else None, key, now,
+                        waiting_for_frame=waiting_for_frame)
         if self.pending_request:
             kind, expires = self.pending_request
             if now >= expires or session.command('COMMENTARY_REQUEST', kind):

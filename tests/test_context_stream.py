@@ -336,6 +336,22 @@ class StreamTests(unittest.TestCase):
         self.assertEqual(stream.preview()['SCREEN_FRAME']['bytes'], 1)
         self.assertNotIn(frame.data, stream.preview().values())
 
+    def test_first_frame_and_latest_frame_share_the_classification_schedule(self):
+        stream = ContextStream()
+        stream.start('sprint', {})
+        stream.observe(facts(), None, 'window', 20, 2, waiting_for_frame=True)
+        self.assertNotIn('ACTIVITY_DURATION', stream.pending)
+        first = Frame(b'first', b'a', 1, 1, 20.1)
+        stream.observe(facts(), first, 'window', 20.1, 2)
+        self.assertIn('ACTIVITY_DURATION', stream.pending)
+        stream.pending.clear()
+        stream.observe(facts(), Frame(b'replaced', b'b', 1, 1, 21), 'window', 21, 2)
+        self.assertNotIn('ACTIVITY_DURATION', stream.pending)
+        newest = Frame(b'latest', b'c', 1, 1, 22.2)
+        stream.observe(facts(), newest, 'window', 22.2, 2)
+        self.assertIs(stream.pending['SCREEN_FRAME'].data, newest)
+        self.assertEqual(next(reversed(stream.pending)), 'ACTIVITY_DURATION')
+
     def test_new_frame_coalesces_without_invalidating_an_in_flight_assessment(self):
         stream = ContextStream()
         stream.start('sprint', {})

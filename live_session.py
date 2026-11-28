@@ -6,7 +6,7 @@ import math
 import logging
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from activity_protocol import PROTOCOL_PROMPT, SYSTEM_PROMPT, Result
 from commentary import INSTRUCTION, KINDS
@@ -155,14 +155,14 @@ class LiveSession:
             self.invalidate()
             self.wake.set()
 
-    def observe(self, facts, frame, key, now):
+    def observe(self, facts, frame, key, now, *, waiting_for_frame=False):
         if not self.task:
             return
         if self.block_reason:
             LOG.info('Gemini Live analysis resumed with permitted context')
         self.block_reason = None
         before = self.stream.stamp
-        self.stream.observe(facts, frame, key, now, self.interval)
+        self.stream.observe(facts, frame, key, now, self.interval, waiting_for_frame=waiting_for_frame)
         if before != self.stream.stamp:
             self.invalidate()
         if self.stream.pending:
@@ -213,37 +213,47 @@ class LiveSession:
                 self._profile_timeout('previous_turn_timeout')
                 raise LiveProtocolError('Gemini не завершил предыдущий ход до истечения тайм-аута.') from None
             wait_finished = clock() if recording else None
-            while (self.stream.generation == generation and self.stream.pending
-                   and not self.interrupted and not self.block_reason):
-                kind, event = self.stream.pending.popitem(last=False)
-                if kind == 'COMMENTARY_REQUEST':
-                    self.queued_request = event.data
-                if kind == 'ACTIVITY_DURATION':
-                    self.requested, self.queued_request = self.queued_request, None
-                    self.turn = event.sequence
-                    self.sent_at = time.monotonic()
-                    self.assessment_due = self.sent_at + self.response_timeout
-                    self.analysis_state = 'ANALYZING'
-                dispatched = clock() if recording and kind == 'ACTIVITY_DURATION' else None
-                if not await self._send_with_timeout(self._send_event(transport, event), kind):
-                    if self.turn == event.sequence:
-                        self.assessment_due = None
-                    if not self.block_reason and event.stamp == self.stream.stamp:
-                        self.hold('window_changed_before_send')
-                    break
-                self.sent += 1
-                if kind == 'ACTIVITY_DURATION':
-                    if recording and event.recording_id == recording.id:
-                        trace = getattr(transport, 'profile_turn', None)
-                        scope = trace.scope if trace and trace.scope['turn_id'] == event.sequence else recording.scope(event.stamp, event.sequence)
-                        previous = max(0, wait_finished - max(wait_started, event.queued_ns)) if waiting_for_turn else 0
-                        if previous:
-                            recording.submit('latency', 'previous_turn', previous, scope, at=wait_finished)
-                        recording.submit('latency', 'transmission_queue', dispatched - event.queued_ns - previous,
-                                         scope, at=dispatched)
-                    if self.stream.pending:
-                        wake.set()
-                    break
+            await self._send_with_timeout(self._dispatch_turn(
+                transport, generation, recording, wait_started if waiting_for_turn else None, wait_finished,
+            ), 'передача наблюдения')
+            if 'ACTIVITY_DURATION' in self.stream.pending:
+                wake.set()
+
+    async def _dispatch_turn(self, transport, generation, recording, waited_from, ready_at):
+        # Take the observation after wait_ready, in the same task that sends it.
+        # Buffering the Gemini delta events costs no additional network awaits.
+        while (self.stream.generation == generation and self.stream.pending
+               and not self.interrupted and not self.block_reason
+               and 'ACTIVITY_DURATION' in self.stream.pending):
+            kind, event = self.stream.pending.popitem(last=False)
+            if kind == 'COMMENTARY_REQUEST':
+                self.queued_request = event.data
+            elif kind == 'ACTIVITY_DURATION':
+                event = replace(event, current_frame=self.stream.latest.get('SCREEN_FRAME'))
+                self.stream.last_duration = self.stream.last_seen
+                self.requested, self.queued_request = self.queued_request, None
+                self.turn = event.sequence
+                self.sent_at = time.monotonic()
+                self.assessment_due = self.sent_at + self.response_timeout
+                self.analysis_state = 'ANALYZING'
+            dispatched = clock() if recording and kind == 'ACTIVITY_DURATION' else None
+            if not await self._send_event(transport, event):
+                if self.turn == event.sequence:
+                    self.assessment_due = None
+                if not self.block_reason and event.stamp == self.stream.stamp:
+                    self.hold('window_changed_before_send')
+                return
+            self.sent += 1
+            if kind == 'ACTIVITY_DURATION':
+                if recording and event.recording_id == recording.id:
+                    trace = getattr(transport, 'profile_turn', None)
+                    scope = trace.scope if trace and trace.scope['turn_id'] == event.sequence else recording.scope(event.stamp, event.sequence)
+                    previous = max(0, ready_at - max(waited_from, event.queued_ns)) if waited_from is not None else 0
+                    if previous:
+                        recording.submit('latency', 'previous_turn', previous, scope, at=ready_at)
+                    recording.submit('latency', 'transmission_queue', dispatched - event.queued_ns - previous,
+                                     scope, at=dispatched)
+                return
 
     async def _send_event(self, transport, event):
         if (self.block_reason or event.stamp != self.stream.stamp
