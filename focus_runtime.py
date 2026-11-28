@@ -16,6 +16,12 @@ from focus_meter import ActivityMonitor, ActivityState, DistractionMeter, Foregr
 from intervention import InterventionEngine
 from live_focus import LiveFocus
 from commentary import KINDS
+from performance import clock
+
+
+FOREGROUND_INTERVAL = .25
+MONITOR_INTERVAL = .1
+WINDOW_SETTLING = .5
 
 
 @dataclass(frozen=True)
@@ -68,6 +74,7 @@ class FocusController:
                 logging.exception('[HUD] Could not create the overlay.')
         self.phase_key = None
         self.next_sample = 0.0
+        self.profile_settling = None
         self.sample = Foreground(), False
         self.state = ActivityState.BREAK
         self.reason = ''
@@ -125,6 +132,7 @@ class FocusController:
         self.was_private = False
         self.alerted = Severity.NORMAL
         self.next_sample = 0
+        self.profile_settling = None
         self.sample = Foreground(), False
         self.state = ActivityState.BREAK
         self.reason = ''
@@ -227,14 +235,17 @@ class FocusController:
         else:
             if now >= self.next_sample:
                 self.sample = self.monitor.sample(recording) if recording else self.monitor.sample()
-                self.next_sample = now + 1.0
+                next_poll = self.next_sample + FOREGROUND_INTERVAL
+                self.next_sample = next_poll if next_poll > now else now + FOREGROUND_INTERVAL
             window, idle = self.sample
             private = self.acquisition.privacy.excluded(window)
             if private and not self.was_private:
                 self.suspend('excluded_window')
                 self.sample = window, idle
-                self.next_sample = now + 1
+                self.next_sample = now + FOREGROUND_INTERVAL
             self.was_private = private
+            if recording and window != self.acquisition.context.window:
+                self.profile_settling = (recording.id, clock()) if not (private or idle) else None
             self.acquisition.sample(now, window, idle=idle or not self.use_ai())
             context = self.acquisition.context
             signature = (phase.context, *context.observation_key())
@@ -250,12 +261,19 @@ class FocusController:
                 blocked = ('excluded_window', 'Окно исключено из анализа.')
             elif idle:
                 blocked = ('idle', 'Давно не было мыши или клавиатуры.')
-            elif now - context.entered < 2 or not self.acquisition.foreground_is_current():
+            elif now - context.entered < WINDOW_SETTLING or not self.acquisition.foreground_is_current():
                 blocked = ('window_settling', 'Ожидаю актуальный контекст окна.')
             if blocked:
+                if blocked[0] != 'window_settling':
+                    self.profile_settling = None
                 self.live.session.hold(blocked[0], paused=not self.use_ai())
                 self.state, self.reason = ActivityState.UNCERTAIN, blocked[1]
             else:
+                if recording and self.profile_settling:
+                    recording_id, detected = self.profile_settling
+                    if recording.id == recording_id:
+                        recording.latency('window_stabilization', detected, clock(), recording.scope())
+                self.profile_settling = None
                 facts, frame = context.snapshot(now, phase.context, self.meter.score)
                 result = self.live.sample(now, phase, signature, facts, frame)
                 finished = self.live.session.finished_at
@@ -307,7 +325,7 @@ class FocusController:
                     self.suspend()
                     logging.exception('[Focus] Could not update focus status')
                     await asyncio.sleep(2)
-                await asyncio.sleep(.25)
+                await asyncio.sleep(MONITOR_INTERVAL)
         finally:
             if self.intervention:
                 self.intervention.clear()

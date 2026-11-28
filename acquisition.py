@@ -55,6 +55,7 @@ class Acquisition:
         self.media = windows.MediaMonitor() if windows and config.get('media_context_enabled') is True else None
         self.capture_job = self.media_job = self.apps_job = None
         self.next_capture = self.next_media = self.next_apps = 0
+        self.capture_not_before = 0.0
         self.capture_epoch = 0
         self.capture_sprint = None
         self.capture_skip = 'disabled'
@@ -221,9 +222,12 @@ class Acquisition:
                 self.reset_frame()
             self.capture_skip = 'idle' if idle else 'window_excluded'
             return
-        if self.capture_job or now < self.next_capture:
+        # Resetting a window ends its adaptive backoff, but a rapid sequence of
+        # window switches should not exceed the configured capture rate.
+        if self.capture_job or now < max(self.next_capture, self.capture_not_before):
             return
         self.job_epoch = self.capture_epoch
+        self.capture_not_before = now + self.interval
         self.next_capture = now + self.adaptive_interval
         recording = self.profiler.active if self.profiler else None
         args = (window, self.dimensions, self.quality)

@@ -448,6 +448,8 @@ class SprintWebSocketTests(unittest.IsolatedAsyncioTestCase):
                             nonlocal foreground
                             previous = session.last_success
                             foreground = ide
+                            if expect_frame:
+                                await asyncio.sleep(max(0, acquisition.capture_not_before - time.monotonic()))
                             tracker.next_sample = 0
                             tracker._tick(time.monotonic())
                             if expect_frame:

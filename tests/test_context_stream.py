@@ -55,14 +55,16 @@ class AcquisitionTests(unittest.IsolatedAsyncioTestCase):
         await old_job
         source.sample(now + .2, chrome)
         self.assertIsNone(source.context.frame)
+        self.assertIsNone(source.capture_job)
+        source.sample(now + source.interval, chrome)
         await source.capture_job
-        source.sample(now + .3, chrome)
+        source.sample(now + source.interval + .1, chrome)
         self.assertEqual(source.context.frame.data, chrome.executable.encode())
         self.assertEqual(source.frames_captured, 1)
         self.assertEqual(source.context.user_apps, ['editor.exe'])
         windows.capture_window.assert_called_once_with(ide, (1280, 720), 80)
         self.assertEqual(windows.capture_browser_window.call_args.args[:3], (chrome, (1280, 720), 80))
-        source.sample(now + .4, excluded)
+        source.sample(now + source.interval + .2, excluded)
         self.assertIsNone(source.context.frame)
         self.assertIsNone(source.capture_job)
         self.assertEqual(source.capture_skip, 'window_excluded')

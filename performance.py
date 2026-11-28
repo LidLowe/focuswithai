@@ -27,6 +27,7 @@ EXPORT_LIMIT = 12000
 EDGES = (0, *sorted({round(1.05 ** i) for i in range(610)}))
 METRICS = {
     'foreground': 'Получение активного окна',
+    'window_stabilization': 'От обнаружения окна до допуска к анализу',
     'turn_ready': 'От отправки до готовности к следующему ходу',
     'frame_age_at_send': 'Возраст кадра при подготовке отправки',
     'classification_interval': 'Интервал принятых классификаций',
