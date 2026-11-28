@@ -134,12 +134,15 @@ class GeminiLiveTransport(LiveTransport):
                 raise LiveSetupError(f'Gemini отклонил подключение (HTTP {error.status}). Проверь ключ и доступ к модели.') from None
             raise LiveProtocolError(f'WebSocket handshake отклонён (HTTP {error.status}).') from None
         LOG.info('Gemini Live WebSocket handshake succeeded')
+        generation_config = {
+            'responseModalities': ['AUDIO'],
+            'speechConfig': {'voiceConfig': {'prebuiltVoiceConfig': {'voiceName': self.voice}}},
+        }
+        if self.extended:
+            generation_config['thinkingConfig'] = {'thinkingLevel': 'LOW'}
         await self._send_json({'setup': {
             'model': 'models/' + self.model,
-            'generationConfig': {
-                'responseModalities': ['AUDIO'],
-                'speechConfig': {'voiceConfig': {'prebuiltVoiceConfig': {'voiceName': self.voice}}},
-            },
+            'generationConfig': generation_config,
             'systemInstruction': {'parts': [{'text': f'{instructions}\n\n{REPORT_INSTRUCTIONS}'}]},
             'contextWindowCompression': {'triggerTokens': self.trigger_tokens,
                                          'slidingWindow': {'targetTokens': self.target_tokens}},

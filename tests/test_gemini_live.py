@@ -184,6 +184,7 @@ class GeminiTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(base64.b64decode(blob['data']), b'fixture')
         self.assertEqual(requests[0], 'fixture-key')
         self.assertEqual(requests[1]['setup']['model'], 'models/' + DEFAULTS['gemini_live_model'])
+        self.assertNotIn('thinkingConfig', requests[1]['setup']['generationConfig'])
         turn_text = requests[2]['clientContent']['turns'][0]['parts'][0]['text']
         self.assertNotIn('SCREEN_FRAME', turn_text)
         self.assertEqual(json.loads(turn_text)['requested_commentary'], 'NEXT_STEP')
@@ -227,6 +228,7 @@ class GeminiTransportTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await adapter.close()
         self.assertEqual(setups[0]['model'], 'models/' + model)
+        self.assertEqual(setups[0]['generationConfig']['thinkingConfig'], {'thinkingLevel': 'LOW'})
         self.assertEqual(setups[0]['tools'][0]['functionDeclarations'][0]['behavior'], 'NON_BLOCKING')
         self.assertEqual(setups[0]['generationConfig']['speechConfig']['voiceConfig']['prebuiltVoiceConfig']['voiceName'],
                          'Orus')
